@@ -1096,7 +1096,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.37';
+var CUSTOM_APP_VERSION = '14.38';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -8135,8 +8135,39 @@ function _qpSavePosition() {
     const audio = document.getElementById('quranAudioPlayer');
     if (!audio || _qpReciterIdx < 0 || _qpSurahNum < 1) return;
     const t = audio.currentTime || 0;
+    // BUG (07/09/2026, box aboubakr — "reprise à 0 sur la même sourate" ;
+    // explique aussi KM22 "toujours bloqué sur la même sourate") : à CHAQUE
+    // boot/reload, _qpEnsureLoadedOnBoot -> _qpAutoLoadIfNeeded force
+    // _qpRestoring=false PUIS appelle _playQP(false), qui appelle
+    // _qpSavePosition() AVANT de poser audio.src (donc currentTime=0). L'ancien
+    // garde « t===0 && paused && !src » ne se déclenchait JAMAIS car `src`
+    // retombait sur _buildQPUrl(...) (jamais vide) -> on réécrivait
+    // currentTime:0 / JS_QP_POSITION_TIME="0" par-dessus la position réelle
+    // (ex. Taha à 15 min), à chaque démarrage.
+    // `audio.played.length === 0` = l'élément n'a rien joué cette session
+    // (survit à audio.src + load()). Dans ce cas on met quand même à jour la
+    // SÉLECTION (reciter/surah) — sinon un choix fait sans lancer la lecture
+    // serait perdu au reboot — mais on NE réécrit PAS la position temporelle :
+    // on garde celle du stockage si elle porte sur la même sélection, sinon 0.
+    var _neverPlayed = !audio.played || audio.played.length === 0;
+    if (t === 0 && audio.paused && _neverPlayed) {
+        try {
+            var _stored = {};
+            try { _stored = JSON.parse(localStorage.getItem(_QP_STORAGE_KEY) || '{}') || {}; } catch(e) {}
+            var _keepT = (_stored.reciterIdx === _qpReciterIdx
+                          && _stored.surahNum === _qpSurahNum
+                          && typeof _stored.currentTime === 'number' && _stored.currentTime > 0)
+                         ? _stored.currentTime : 0;
+            localStorage.setItem(_QP_STORAGE_KEY, JSON.stringify({
+                reciterIdx: _qpReciterIdx, surahNum: _qpSurahNum, currentTime: _keepT
+            }));
+            localStorage.setItem(_QP_STORAGE_SRC_KEY, _buildQPUrl(_qpReciterIdx, _qpSurahNum));
+            localStorage.setItem(_QP_STORAGE_TIME_KEY, String(_keepT));
+            if (_keepT > 0) _L('AUDIO','INFO',{action:'save_keep_seek_boot',keptSeekTime:_keepT,reciter:_qpReciterIdx,surah:_qpSurahNum});
+        } catch(e) {}
+        return; // position temporelle préservée, pas d'écrasement à 0
+    }
     const src = audio.currentSrc || audio.src || _buildQPUrl(_qpReciterIdx, _qpSurahNum);
-    if (t === 0 && audio.paused && !src) return; // audio non initialisé
     try {
         localStorage.setItem(_QP_STORAGE_KEY, JSON.stringify({
             reciterIdx:  _qpReciterIdx,
