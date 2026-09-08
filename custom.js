@@ -575,7 +575,8 @@ function _ucBindGuidedInput(el, type) {
         connected:     { AR: 'متصل', FR: 'Connecté', EN: 'Connected' },
         disconnected:  { AR: 'غير متصل', FR: 'Non connecté', EN: 'Disconnected' },
         ssid:          { AR: 'الشبكة', FR: 'Réseau', EN: 'Network' },
-        ip:            { AR: 'عنوان IP', FR: 'Adresse IP', EN: 'IP address' },
+        ip:            { AR: 'عنوان IP المحلي', FR: 'Adresse IP locale', EN: 'Local IP address' },
+        ipVpn:         { AR: 'عنوان Tailscale', FR: 'Adresse Tailscale', EN: 'Tailscale address' },
         typeWifi:      { AR: 'واي فاي', FR: 'Wi-Fi', EN: 'Wi-Fi' },
         typeEthernet:  { AR: 'سلكي (إيثرنت)', FR: 'Filaire (Ethernet)', EN: 'Wired (Ethernet)' },
         openSettings:  { AR: 'فتح إعدادات الشبكة', FR: 'Ouvrir les paramètres réseau', EN: 'Open network settings' }
@@ -709,7 +710,16 @@ function _ucBindGuidedInput(el, type) {
             } else {
                 lines.push(_netT('ssid') + ' : ' + (info.type === 'wifi' ? _netT('typeWifi') : _netT('typeEthernet')));
             }
-            if (info.ip) lines.push(_netT('ip') + ' : ' + info.ip);
+        }
+        if (info.connected) {
+            // IP locale (LAN) et IP Tailscale affichées séparément. Anciens
+            // builds natifs : lanIp/vpnIp absents -> repli sur `ip` (réseau
+            // actif, = le 100.x quand le VPN est monté). `ip` peut aussi
+            // servir de LAN quand il n'y a pas de VPN.
+            var _lan = info.lanIp || (info.ip && info.ip.indexOf('100.') !== 0 ? info.ip : '');
+            var _vpn = info.vpnIp || (info.ip && info.ip.indexOf('100.') === 0 ? info.ip : '');
+            if (_lan) lines.push(_netT('ip') + ' : ' + _lan);
+            if (_vpn && _vpn !== _lan) lines.push(_netT('ipVpn') + ' : ' + _vpn);
         }
         _bodyEl.innerHTML = lines.join('<br>');
         _ov.style.display = 'flex';
@@ -1096,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.39';
+var CUSTOM_APP_VERSION = '14.40';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
