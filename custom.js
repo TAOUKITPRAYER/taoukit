@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.40';
+var CUSTOM_APP_VERSION = '14.41';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -3633,7 +3633,26 @@ window._ucForceCloseAllCounterOverlays = function () {
         if (_wasSalatNabiVis && typeof window._ucSalatNabiForceHide === 'function') {
             window._ucSalatNabiForceHide('resync_' + (reason || 'visibilitychange'));
         }
-        if (typeof window.hideAzanPopupFunction === 'function') window.hideAzanPopupFunction();
+        // N'appeler hideAzanPopupFunction() (monkey-patchée -> émet UC_EVT.AZAN_HIDE)
+        // QUE si un écran azan était réellement actif. Sinon (nettoyage à vide),
+        // cette cascade ré-émettait un AZAN_HIDE périmé : les consommateurs
+        // (ampliExtOff différé, salatNabi, doua post-azan) le traitaient comme
+        // une vraie fin d'azan de la prière courante -- incident box aboubakr
+        // 07/09/2026, ampli azan coupé en plein Coran pré-Isha par un
+        // "ampliExtOff de Maghreb" différé de 120 s. Le blindage _ucEventFresh /
+        // _ucDefer reste le second filet ; ceci coupe la source.
+        var _azanScreenActive = _wasAzanBlocked || _wasNativeAzanPlaying ||
+            ['azanPopupVertical', 'azanPopupHorizontal'].some(function(id) {
+                var el = document.getElementById(id);
+                return el && (el.className === 'visibleTransitionClass' ||
+                              getComputedStyle(el).visibility === 'visible');
+            });
+        if (_azanScreenActive && typeof window.hideAzanPopupFunction === 'function') {
+            window.hideAzanPopupFunction();
+        } else {
+            _L('RESYNC', 'SKIP', { action: 'hideAzanPopup', reason: 'no_azan_screen_active',
+                note: 'pas de AZAN_HIDE ré-émis' });
+        }
         if (typeof window.deactivateBlackScreen === 'function') window.deactivateBlackScreen();
         if (typeof window.hideAzkarDisplayFunction === 'function') window.hideAzkarDisplayFunction();
         if (typeof window.hideSlidesDisplayFunction === 'function') window.hideSlidesDisplayFunction();
@@ -4745,6 +4764,201 @@ function _ucCurrentPrayerKey() {
     return k;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// BLINDAGE DE L'EXÉCUTION DES ACTIONS DIFFÉRÉES
+// ─────────────────────────────────────────────────────────────────────────────
+// Toute action programmée à retardement (setTimeout : ampliExt/Int Off, mihrab,
+// minaret, blinks, fin.ogg, takbir, doua post-azan, salatNabi…) doit re-valider
+// ses conditions AU MOMENT DU TIR, pas seulement à la programmation. Un
+// événement rejoué à tort (ex. AZAN_HIDE ré-émis par _ucResyncPrayerSequence
+// ~1 h après l'azan concerné — incident box tn.monastir.aboubakr 07/09/2026,
+// ampliExt coupé en plein Coran pré-Isha par un ampliExtOff « de Maghreb »
+// différé de 120 s) devient alors CADUC : trace, aucun effet.
+//
+// Identité d'occurrence = (clé de prière, epoch d'azan absolu du jour) +
+// compteur de cycle monotone. L'epoch d'azan est calculé depuis la table
+// d'horaires (indépendant de Date.now() au moment de la programmation, donc
+// immunisé contre un rejeu qui « ré-horodate » l'instant courant).
+// ═══════════════════════════════════════════════════════════════════════════
+
+var _ucCycleSeq       = 0;    // +1 à chaque UC_EVT.AZAN_TIME (cf. handler différé plus bas)
+var _ucCyclePrayerKey = '';   // prière annoncée par le dernier AZAN_TIME
+var _ucCycleStartedAt = 0;    // Date.now() du dernier AZAN_TIME
+
+// Fenêtre de validité (ms APRÈS l'epoch d'azan) par famille de déclencheur.
+// Tout ancré sur l'epoch d'azan (fiable) : les gardes clé-de-prière + cycle
+// font le travail fin, la péremption n'est qu'un filet contre les rejeux à
+// l'échelle de l'heure. Valeurs larges et volontairement généreuses.
+var _UC_TRIGGER_LAG = {
+    beforeAzan:     3  * 60 * 1000,
+    preAzanQuran:   3  * 60 * 1000,
+    finOgg:         3  * 60 * 1000,
+    afterAzanShow:  8  * 60 * 1000,
+    afterAzanHide:  20 * 60 * 1000,
+    beforeIqama:    25 * 60 * 1000,
+    atIqamaZero:    30 * 60 * 1000,
+    afterBlackHide: 50 * 60 * 1000,
+    takbir:         60 * 60 * 1000
+};
+// Familles évaluées AVANT l'azan (clé = prière à venir) plutôt qu'après.
+var _UC_PRE_FAMILIES = { beforeAzan: 1, preAzanQuran: 1, finOgg: 1, takbir: 1 };
+
+function _ucNowMs() { return Date.now(); }
+
+// Epoch (ms) de l'azan d'une prière AUJOURD'HUI depuis la table d'horaires.
+// Renvoie 0 si les horaires ne sont pas encore calculés (cold start) → la
+// péremption bascule alors sur un repli borné (cf. _ucOccValid), les gardes
+// clé/cycle restent actives.
+function _ucPrayerAzanEpoch(key) {
+    try {
+        if (!key) return 0;
+        var lk = (key === 'JOMOA') ? 'DOHR' : key;   // pas de créneau propre côté cœur
+        var mins = (typeof _ucPrayerMinutes === 'function') ? _ucPrayerMinutes(lk) : -1;
+        if (typeof mins !== 'number' || mins <= 0) return 0;
+        var now = new Date();
+        var mid = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+        var epoch = mid + mins * 60000;
+        // Wrap nuit : Isha « courante » après minuit et avant Fajr → azan de la veille.
+        var nowMin = now.getHours() * 60 + now.getMinutes();
+        if (key === 'ISHA' && nowMin < mins && nowMin < 360) epoch -= 24 * 3600 * 1000;
+        return epoch;
+    } catch (e) { return 0; }
+}
+
+// Contexte capturé au moment de PROGRAMMER une action différée.
+function _ucCaptureOcc(prayerKey, family) {
+    var pk = prayerKey || (_UC_PRE_FAMILIES[family] ? _getUpcomingPrayerKey() : _ucCurrentPrayerKey());
+    return {
+        prayerKey:  pk || '',
+        family:     family || '',
+        cycleSeq:   _ucCycleSeq,
+        azanEpoch:  _ucPrayerAzanEpoch(pk),
+        capturedAt: _ucNowMs()
+    };
+}
+
+// La clé de prière de l'occurrence correspond-elle encore à MAINTENANT ?
+function _ucOccKeyStill(ctx) {
+    if (!ctx || !ctx.prayerKey) return true;   // pas de clé capturée → ne pas bloquer
+    var cur = _ucCurrentPrayerKey();
+    if (cur && cur === ctx.prayerKey) return true;
+    if (_UC_PRE_FAMILIES[ctx.family]) {
+        var up = _getUpcomingPrayerKey();
+        if (up && up === ctx.prayerKey) return true;   // encore avant l'azan de sa prière
+    }
+    return false;
+}
+
+// Validité complète d'une action différée à l'instant du tir.
+// Renvoie { ok:true } ou { ok:false, reason, ... }.
+function _ucOccValid(ctx, delayMs) {
+    if (!ctx) return { ok: true };
+    var isPre = !!_UC_PRE_FAMILIES[ctx.family];
+
+    // 1) Clé de prière
+    if (!_ucOccKeyStill(ctx)) {
+        return { ok: false, reason: 'prayer_changed', was: ctx.prayerKey || '?',
+                 now: _ucCurrentPrayerKey() || '?', up: _getUpcomingPrayerKey() || '?' };
+    }
+
+    // 2) Cycle d'azan. Post-azan : tout AZAN_TIME survenu depuis la capture
+    //    invalide. Pré-azan : on traverse volontairement l'AZAN_TIME de sa
+    //    propre prière (+1 toléré), pas au-delà.
+    var dSeq = _ucCycleSeq - (ctx.cycleSeq || 0);
+    if (isPre ? (dSeq > 1 || dSeq < 0) : (dSeq !== 0)) {
+        return { ok: false, reason: 'cycle_changed', was: ctx.cycleSeq, now: _ucCycleSeq };
+    }
+
+    // 3) Péremption
+    var lag = _UC_TRIGGER_LAG[ctx.family] || (20 * 60 * 1000);
+    if (ctx.azanEpoch) {
+        if (_ucNowMs() > ctx.azanEpoch + lag) {
+            return { ok: false, reason: 'expired',
+                     ageMin: Math.round((_ucNowMs() - ctx.azanEpoch) / 60000) };
+        }
+    } else {
+        // Epoch inconnu (cold start) : repli borné sur l'instant de capture.
+        var cap = (ctx.capturedAt || _ucNowMs()) + (delayMs || 0) + lag;
+        if (_ucNowMs() > cap) {
+            return { ok: false, reason: 'expired_fallback',
+                     ageMin: Math.round((_ucNowMs() - (ctx.capturedAt || _ucNowMs())) / 60000) };
+        }
+    }
+    return { ok: true };
+}
+
+// setTimeout gardé : fn n'est exécutée que si l'occurrence est toujours valide.
+// cat/act = catégorie + libellé pour la trace SKIP_STALE. extra = champs de log.
+// Renvoie l'id de timer brut → clearTimeout(...) fonctionne côté appelants.
+function _ucDefer(family, ctx, delayMs, fn, cat, act, extra) {
+    return setTimeout(function() {
+        var v = _ucOccValid(ctx, delayMs);
+        if (!v.ok) {
+            _L(cat || 'EVT', 'SKIP_STALE', Object.assign(
+                { family: family, item: (act || ''), reason: v.reason },
+                v.reason === 'prayer_changed' ? { was: v.was, now: v.now } :
+                v.reason.indexOf('expired') === 0 ? { ageMin: v.ageMin } :
+                { was: v.was, now: v.now },
+                extra || {}));
+            return;
+        }
+        try { fn(); } catch (e) {
+            _L(cat || 'EVT', 'ERR', { family: family, item: (act || ''), err: (e && e.message) || String(e) });
+        }
+    }, delayMs);
+}
+
+// Garde « fraîcheur d'événement » : à appeler en tête d'un ucOn(AZAN_HIDE /
+// AZAN_SHOW / IQAMA_* / BLACK_*). Rejette un événement rejoué bien après
+// l'azan de la prière en cours (rejeu périmé — ex. cascade
+// _ucResyncPrayerSequence → hideAzanPopupFunction → AZAN_HIDE).
+function _ucEventFresh(family) {
+    var cur = _ucCurrentPrayerKey();
+    var epoch = _ucPrayerAzanEpoch(cur);
+    if (!epoch) return true;   // horaires pas prêts → ne pas bloquer
+    var lag = _UC_TRIGGER_LAG[family] || (20 * 60 * 1000);
+    // Écho périmé juste après un resync qui vient de tout nettoyer (même
+    // précédent que jomoa_adab / _ucLastResyncCloseAt).
+    var sinceResync = _ucNowMs() - (window._ucLastResyncCloseAt || 0);
+    if (_ucNowMs() > epoch + lag) {
+        _L('EVT', 'EVT_STALE', { family: family, prayer: cur || '?',
+            ageMin: Math.round((_ucNowMs() - epoch) / 60000),
+            sinceResyncMs: sinceResync < 60000 ? sinceResync : null });
+        return false;
+    }
+    return true;
+}
+
+// Enregistrement du cycle d'azan (différé : UC_EVT est const, TDZ à l'éval).
+setTimeout(function() {
+    ucOn(UC_EVT.AZAN_TIME, function(e) {
+        _ucCycleSeq++;
+        _ucCyclePrayerKey = (e && e.prayer) || _ucCurrentPrayerKey() || '';
+        _ucCycleStartedAt = _ucNowMs();
+    });
+}, 0);
+
+// Test console : _ucTestStaleAction('afterAzanHide') → doit tracer SKIP_STALE.
+window._ucTestStaleAction = function(family) {
+    family = family || 'afterAzanHide';
+    var ctx = _ucCaptureOcc(null, family);
+    // Falsifie : prière précédente + capture d'il y a 2 h + cycle antérieur.
+    ctx.prayerKey  = '__STALE__';
+    ctx.cycleSeq   = _ucCycleSeq - 1;
+    ctx.azanEpoch  = _ucNowMs() - 2 * 3600 * 1000;
+    ctx.capturedAt = _ucNowMs() - 2 * 3600 * 1000;
+    var v = _ucOccValid(ctx, 0);
+    _L('TEST', 'STALE_ACTION', { family: family, ok: v.ok, reason: v.reason || '—' });
+    return v;
+};
+
+window._ucCaptureOcc   = _ucCaptureOcc;
+window._ucOccValid     = _ucOccValid;
+window._ucOccKeyStill  = _ucOccKeyStill;
+window._ucDefer        = _ucDefer;
+window._ucEventFresh   = _ucEventFresh;
+window._ucPrayerAzanEpoch = _ucPrayerAzanEpoch;
+
 // ── Exécution d'une commande HTTP (no-cors, fire-and-forget) ─────────────
 // silent=true : pas de trace HTTP (utilisé pour les ticks strobe intermédiaires)
 // _httpErrSilenced : après la 1re erreur par item/cycle, les suivantes sont muettes
@@ -5129,6 +5343,15 @@ function _applyLightTriggers(remainingMinutes) {
         _lightFiredSet[item.key] = true;
         var _ctx = { item: item.key, evt: 'beforeAzan', prayer: _upcomingKey,
                      rem: remainingMinutes.toFixed(1)+'min', threshold: thresholdMin.toFixed(1)+'min' };
+
+        // Blindage : _upcomingKey pointe une prière dont l'azan est déjà loin
+        // derrière (compteur périmé rejoué) → on ne déclenche pas.
+        var _azEp = _ucPrayerAzanEpoch(_upcomingKey);
+        if (_azEp && Date.now() > _azEp + _UC_TRIGGER_LAG.beforeAzan) {
+            _L('LIGHTS','SKIP_STALE', Object.assign({},_ctx,{reason:'azan_epoch_passed',
+                ageMin:Math.round((Date.now()-_azEp)/60000)}));
+            return;
+        }
 
         // Log Quran offset ici — une seule fois, juste avant la décision FIRE/SKIP
         if (quranDelaySec > 0) {
@@ -5530,6 +5753,13 @@ function applyNextPrayerHighlight(remainingMinutes) {
 
         if (remainingMinutes <= startThresholdMin && isBeforeStopWindow && !_sqaFired) {
             _sqaFired = true;
+            // Blindage : compteur périmé pointant une prière dont l'azan est
+            // déjà passé → ne pas lancer le Coran pré-azan.
+            var _qAzEp = _ucPrayerAzanEpoch(nextKey);
+            if (_qAzEp && Date.now() > _qAzEp + _UC_TRIGGER_LAG.preAzanQuran) {
+                _L('AUDIO','SKIP',{action:'autoStart',prayer:nextKey,reason:'stale_azan_epoch_passed',
+                    ageMin:Math.round((Date.now()-_qAzEp)/60000)});
+            } else
             // Vérifications métier — loggées à la décision
             if (!_isAutoStartEnabledForPrayer(nextKey)) {
                 _L('AUDIO','SKIP',{action:'autoStart',prayer:nextKey,reason:'prayer_disabled'});
@@ -10948,6 +11178,19 @@ function _playFinAudio() {
 
 function _playFinAudioImpl() {
     if (_ucUnloading) return;
+    // Blindage : rejeu profond (tick gelé plusieurs heures) — si l'azan de la
+    // prière courante ET de la prochaine sont tous deux loin derrière, ce
+    // "son de fin" est périmé. Fenêtre volontairement très large pour ne
+    // jamais gêner le chemin normal (rem≈1 min) ni le rattrapage de resync.
+    try {
+        var _cEp = _ucPrayerAzanEpoch(_ucCurrentPrayerKey());
+        var _uEp = _ucPrayerAzanEpoch(_getUpcomingPrayerKey());
+        var _lim = 30 * 60 * 1000;
+        if (_cEp && _uEp && Date.now() > _cEp + _lim && Date.now() > _uEp + _lim) {
+            _L('AUDIO','SKIP_STALE',{action:'fin_mp3', reason:'deep_replay'});
+            return;
+        }
+    } catch (e) {}
     var localSrc = 'spec/audio/fin.ogg';
 
     // Fallback final : jouer sur quranAudioPlayer (contexte geste utilisateur acquis)
@@ -11501,7 +11744,7 @@ function _cancelStrobe(label) {
 // endWithOn (optionnel, défaut false) : si true, le strobe se termine en état ON
 // => blink réversible : la lumière revient à ON après le clignotement.
 // L'extinction définitive reste exclusivement confiée à minaretOff / mihrabOff.
-function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
+function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn, occ) {
     const INTERVAL_MS = 500;
     const endTime = Date.now() + durationSec * 1000;
     let phase = true;
@@ -11515,10 +11758,13 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
     _L('LIGHTS','FIRE',{action:'strobe_start',item:label,duration:durationSec+'s',endState:_endState});
     (function tick() {
         if (_strobeRunId[label] !== myRunId) return;  // annulé par _cancelStrobe
-        if (Date.now() >= endTime) {
+        // Blindage : la prière a changé pendant le clignotement → arrêt propre
+        // (état final normal), l'occurrence est caduque.
+        var _stale = (occ && typeof _ucOccKeyStill === 'function' && !_ucOccKeyStill(occ));
+        if (Date.now() >= endTime || _stale) {
             var urlFinal = endWithOn ? urlOn : urlOff;
             _ucHttpCall(urlFinal, label);   // état final : loggué (fin visible)
-            _L('LIGHTS','STOP',{action:'strobe_end',item:label,endState:_endState});
+            _L('LIGHTS','STOP',{action:_stale?'strobe_stale':'strobe_end',item:label,endState:_endState});
             delete _strobeUrlOff[label];
             delete _strobeUrlOn[label];
             delete _strobeEndWithOn[label];
@@ -11558,8 +11804,9 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
             const delayMs  = (isNaN(delaySec) || delaySec < 0 ? (item.delayDefault || 0) : delaySec) * 1000;
             var _bh_delaySec = delayMs/1000;
             _L('LIGHTS','FIRE', Object.assign({},_ctx,{delay:_bh_delaySec+'s'}));
+            var _occShow = _ucCaptureOcc(e.prayer || _ucCurrentPrayerKey(), 'afterAzanShow');
             (function(capturedItem, capturedCtx) {
-                setTimeout(function() {
+                _ucDefer('afterAzanShow', _occShow, delayMs, function() {
                     if (JS_CUSTOM[capturedItem.enabledSetting] != 1) {
                         _L('LIGHTS','SKIP_DEFERRED', Object.assign({},capturedCtx,{reason:'disabled_at_fire'}));
                         return;
@@ -11568,7 +11815,7 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
                     if (!u) { _L('LIGHTS','SKIP_DEFERRED', Object.assign({},capturedCtx,{reason:'url_empty_at_fire'})); return; }
                     _L('LIGHTS','HTTP_SEND', capturedCtx);
                     _ucHttpCall(u, capturedItem.key);
-                }, delayMs);
+                }, 'LIGHTS', capturedItem.key, {evt:'AZAN_SHOW'});
             })(item, Object.assign({},_ctx,{delay:_bh_delaySec+'s'}));
         });
     });
@@ -11589,7 +11836,9 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
     ucOn(UC_EVT.AZAN_HIDE, function() {
         if (_ucCurrentPrayerKey() === 'SHRQ') return;   // Doha : aucun déclenchement lumières
         if (_ucCurrentPrayerKey() === 'JOMOA' && JS_DATA.ucJomoaOnHRscreen != 1) return; // Jumu'ah désactivée → pas de déclenchement
+        if (!_ucEventFresh('afterAzanHide')) return;    // AZAN_HIDE rejoué bien après l'azan (rejeu resync) → caduc
         const isJomoa = (_ucCurrentPrayerKey() === 'JOMOA');
+        var _occ = _ucCaptureOcc(_ucCurrentPrayerKey(), 'afterAzanHide');
         _lightProgramConfig.forEach(function(item) {
             if (_getItemTrigger(item) !== 'afterAzanHide') return;
             var _ctx = { item: item.key, evt: 'AZAN_HIDE', prayer: _ucCurrentPrayerKey() };
@@ -11625,6 +11874,15 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
             var _capturedCtx = Object.assign({}, _ctx, {delay:delaySec+'s'});
             var _fireItem = (function(capturedItem, capturedCtx) {
                 return function() {
+                    // Blindage : occurrence toujours valide au tir ? (prière
+                    // inchangée, même cycle, pas périmé). Couvre aussi le chemin
+                    // différé via _salatNabiOnEndCallbacks (salatNabi long).
+                    var v = _ucOccValid(_occ, delayMs);
+                    if (!v.ok) {
+                        _L('LIGHTS','SKIP_STALE', Object.assign({},capturedCtx,{reason:v.reason,
+                            was:v.was, now:v.now, ageMin:v.ageMin}));
+                        return;
+                    }
                     if (JS_CUSTOM[capturedItem.enabledSetting] != 1) {
                         _L('LIGHTS','SKIP_DEFERRED', Object.assign({},capturedCtx,{reason:'disabled_at_fire'}));
                         return;
@@ -11635,7 +11893,7 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
                     _ucHttpCall(u, capturedItem.key);
                 };
             })(item, _capturedCtx);
-            setTimeout(function() {
+            _ucDefer('afterAzanHide', _occ, delayMs, function() {
                 if (window._salatNabiActive) {
                     // salatNabi encore en cours → on diffère jusqu'à sa fin
                     _L('LIGHTS','WAIT', Object.assign({},_ctx,{reason:'salatNabi_active'}));
@@ -11644,7 +11902,7 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
                 } else {
                     _fireItem();
                 }
-            }, delayMs);
+            }, 'LIGHTS', 'ampli/mihrab afterAzanHide', {evt:'AZAN_HIDE'});
         });
     });
 })();
@@ -11673,6 +11931,11 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
             var _ctx = { item: item.key, evt: 'COUNTDOWN_TICK', prayer: _ucCurrentPrayerKey(),
                          rem: e.remainingSeconds+'s', threshold: threshold+'s' };
 
+            // Blindage : compteur iqama rejouant une fenêtre périmée (resync
+            // matchant l'iqama d'une prière précédente) → caduc.
+            if (!_ucEventFresh('beforeIqama'))
+                { _L('LIGHTS','SKIP_STALE', Object.assign({},_ctx,{reason:'stale_iqama_window'})); return; }
+
             if (JS_CUSTOM[item.enabledSetting] != 1)
                 { _L('LIGHTS','SKIP', Object.assign({},_ctx,{reason:'disabled'})); return; }
             if (item.pairEnabledSetting && JS_CUSTOM[item.pairEnabledSetting] != 1)
@@ -11689,7 +11952,8 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
                 if (!urlOn || !urlOff)
                     { _L('LIGHTS','SKIP', Object.assign({},_ctx,{reason:'url_empty',mode:'strobe'})); return; }
                 _L('LIGHTS','FIRE', Object.assign({},_ctx,{mode:'strobe',duration:duration+'s'}));
-                _runStrobe(urlOn, urlOff, duration, item.key);
+                _runStrobe(urlOn, urlOff, duration, item.key, false,
+                          _ucCaptureOcc(_ucCurrentPrayerKey(), 'beforeIqama'));
             } else {
                 const url = (JS_CUSTOM[item.urlSetting] || '').trim();
                 if (!url)
@@ -11712,6 +11976,8 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
         // garde, afterBlackHide (ampliIntOff, mihrabOff, rollerClose...) se
         // déclenchait donc aussi malgré la case décochée.
         if (_ucCurrentPrayerKey() === 'JOMOA' && JS_DATA.ucJomoaOnHRscreen != 1) return;
+        if (!_ucEventFresh('afterBlackHide')) return;   // BLACK_HIDE rejoué (resync) → caduc
+        var _occBH = _ucCaptureOcc(_ucCurrentPrayerKey(), 'afterBlackHide');
         _lightProgramConfig.forEach(function(item) {
             if (item.trigger !== 'afterBlackHide') return;
             var _ctx = { item: item.key, evt: 'BLACK_HIDE', prayer: _ucCurrentPrayerKey() };
@@ -11725,11 +11991,11 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
             const delaySec = parseInt(JS_CUSTOM[item.delaySetting], 10);
             const delayMs  = (isNaN(delaySec) || delaySec < 0 ? (item.delayDefault || 0) : delaySec) * 1000;
             _L('LIGHTS','FIRE', Object.assign({},_ctx,{delay:(delayMs/1000)+'s'}));
-            setTimeout(function() {
+            _ucDefer('afterBlackHide', _occBH, delayMs, function() {
                 if (JS_CUSTOM[item.enabledSetting] != 1) return;
                 const u = (JS_CUSTOM[item.urlSetting] || '').trim();
                 if (u) _ucHttpCall(u, item.key);
-            }, delayMs);
+            }, 'LIGHTS', item.key, {evt:'BLACK_HIDE'});
         });
     });
 })();
@@ -11745,6 +12011,8 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
         // garde, afterBlackShow (ampliIntOn, mihrabOn...) se déclenchait donc
         // aussi malgré la case décochée.
         if (_ucCurrentPrayerKey() === 'JOMOA' && JS_DATA.ucJomoaOnHRscreen != 1) return;
+        if (!_ucEventFresh('beforeIqama')) return;   // BLACK_SHOW rejoué (resync) → caduc
+        var _occBS = _ucCaptureOcc(_ucCurrentPrayerKey(), 'beforeIqama');
         _lightProgramConfig.forEach(function(item) {
             if (item.trigger !== 'afterBlackShow') return;
             var _ctx = { item: item.key, evt: 'BLACK_SHOW', prayer: _ucCurrentPrayerKey() };
@@ -11760,11 +12028,11 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
             const delaySec = parseInt(JS_CUSTOM[item.delaySetting], 10);
             const delayMs  = (isNaN(delaySec) || delaySec < 0 ? (item.delayDefault || 0) : delaySec) * 1000;
             _L('LIGHTS','FIRE', Object.assign({},_ctx,{delay:(delayMs/1000)+'s'}));
-            setTimeout(function() {
+            _ucDefer('beforeIqama', _occBS, delayMs, function() {
                 if (JS_CUSTOM[item.enabledSetting] != 1) return;
                 const u = (JS_CUSTOM[item.urlSetting] || '').trim();
                 if (u) _ucHttpCall(u, item.key);
-            }, delayMs);
+            }, 'LIGHTS', item.key, {evt:'BLACK_SHOW'});
         });
     });
 })();
@@ -11773,6 +12041,8 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
 (function _installLightAtIqamaZero() {
     ucOn(UC_EVT.IQAMA_TIME, function() {
         if (_ucCurrentPrayerKey() === 'SHRQ') return;   // Doha : aucun déclenchement lumières
+        if (!_ucEventFresh('atIqamaZero')) return;      // IQAMA_TIME rejoué (resync) → caduc
+        var _occIz = _ucCaptureOcc(_ucCurrentPrayerKey(), 'atIqamaZero');
         // ── Minaret ──────────────────────────────────────────────────────
         var _ctxMin = { item: 'minaretBlink', evt: 'IQAMA_TIME', prayer: _ucCurrentPrayerKey() };
         if (JS_CUSTOM.ucIqamaZeroMinaretBlinkEnabled != 1) {
@@ -11792,7 +12062,7 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
                 } else {
                     var _minaretEndOn = (_ucCurrentPrayerKey() !== 'FAJR'); // MGRB/ISHA: fin en ON | FAJR: fin en OFF
                 _L('LIGHTS','FIRE', Object.assign({},_ctxMin,{mode:'strobe', duration:durMin+'s', urlOn:urlOn, urlOff:urlOff, endState:_minaretEndOn?'ON':'OFF'}));
-                    _runStrobe(urlOn, urlOff, durMin, 'minaretBlink', _minaretEndOn);
+                    _runStrobe(urlOn, urlOff, durMin, 'minaretBlink', _minaretEndOn, _occIz);
                 }
             }
         }
@@ -11813,7 +12083,7 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
                 _L('LIGHTS','SKIP', Object.assign({},_ctxMih,{reason:'url_empty', urlOn:urlOn2||'—', urlOff:urlOff2||'—'}));
             } else {
                 _L('LIGHTS','FIRE', Object.assign({},_ctxMih,{mode:'strobe', duration:durMih+'s', urlOn:urlOn2, urlOff:urlOff2, endState:'ON'}));
-                _runStrobe(urlOn2, urlOff2, durMih, 'mihrabBlink', true);  // reversible : fin en ON
+                _runStrobe(urlOn2, urlOff2, durMih, 'mihrabBlink', true, _occIz);  // reversible : fin en ON
             }
         }
     });
@@ -12111,6 +12381,10 @@ function _runStrobe(urlOn, urlOff, durationSec, label, endWithOn) {
         var prayerOk = _isPrayerEnabled(prayer);
         var _ctx     = { item: 'salatNabi', prayer: prayer, isThursday: isThur };
 
+        if (!_ucEventFresh('afterAzanHide')) {   // AZAN_HIDE rejoué bien après l'azan (rejeu resync) → caduc
+            _L('POPUP','SKIP', Object.assign({}, _ctx, { reason: 'stale_azan_hide' }));
+            return;
+        }
         if (_snFired) {
             _L('POPUP','SKIP', Object.assign({}, _ctx, { reason: 'already_fired' }));
             return;
@@ -16351,8 +16625,15 @@ function forceHijriSyncFunction() {
         if (_fadeTimer) { clearTimeout(_fadeTimer); _fadeTimer = null; }
     });
 
+    var _staleLogged = false;
     function _show() {
         if (_visible) return;
+        // Blindage : fenêtre iqama périmée rejouée par le compteur (resync
+        // matchant l'iqama d'une prière précédente) → ne pas afficher.
+        if (typeof _ucEventFresh === 'function' && !_ucEventFresh('beforeIqama')) {
+            if (!_staleLogged) { _L('POPUP','SKIP',{item:'hadith_iqama',reason:'stale_iqama_window'}); _staleLogged = true; }
+            return;
+        }
         _visible = true;
         if (_fadeTimer) { clearTimeout(_fadeTimer); _fadeTimer = null; }
         _overlay.classList.remove('ucIH-fading');
@@ -16430,6 +16711,7 @@ function forceHijriSyncFunction() {
 
     // ── Sécurité : réinitialiser entre deux prières ───────────────────────
     ucOn(UC_EVT.AZAN_TIME, function() {
+        _staleLogged = false;
         _forceHide();
     });
 
@@ -17002,8 +17284,13 @@ ucOn(UC_EVT.AZAN_TIME,  function () { try { localStorage.removeItem(_UC_JOMOA_AD
     document.body.appendChild(_ov15);
 
     var _visible15 = false;
+    var _staleLogged15 = false;
     function _show15() {
         if (_visible15) return;
+        if (typeof _ucEventFresh === 'function' && !_ucEventFresh('beforeIqama')) {
+            if (!_staleLogged15) { _L('POPUP','SKIP',{item:'hadith_15s',reason:'stale_iqama_window'}); _staleLogged15 = true; }
+            return;
+        }
         _visible15 = true;
         var txt = typeof JS_IqamaRULE === 'string'
             ? JS_IqamaRULE.replace(/^قالَ\s*ﷺ\s*:\s*/u, '').trim()
@@ -17044,7 +17331,7 @@ ucOn(UC_EVT.AZAN_TIME,  function () { try { localStorage.removeItem(_UC_JOMOA_AD
 
     /* Reset a chaque nouveau cycle azan, et des que l'iqama demarre reellement
        (filet de securite supplementaire, meme idee que ucIqamaHadithOverlay). */
-    ucOn(UC_EVT.AZAN_TIME, function () { _visible15 = false; _ov15.style.opacity = '0'; });
+    ucOn(UC_EVT.AZAN_TIME, function () { _visible15 = false; _staleLogged15 = false; _ov15.style.opacity = '0'; });
     ucOn(UC_EVT.IQAMA_SHOW, function () { _hide15(); });
 }());
 
@@ -19068,12 +19355,17 @@ function selectQPTakbir() {
         if (_takbirM0Fired) {
             _L('TAKBIR','SKIP',{mode:'M0',reason:'already_fired'}); return;
         }
+        if (!_ucEventFresh('afterBlackHide')) {
+            _L('TAKBIR','SKIP',{mode:'M0',reason:'stale_black_hide'}); return;
+        }
         _takbirM0Fired = true;
         var delay0  = parseInt(JS_CUSTOM.ucTakbirM0Delay, 10) || 0;
         var dur0    = parseInt(JS_CUSTOM.ucTakbirM0Duration, 10) || 0;
         var delayMs = delay0 * 1000;
+        var _occTk0 = _ucCaptureOcc('MGRB', 'takbir');
         _L('TAKBIR','WAIT',{mode:'M0',delay:delay0,prayer:'MGRB',hijriMonthDay:hijriMonthDay});
-        _takbirTimer = setTimeout(function() { _playTakbirAuto(dur0, delay0); }, delayMs);
+        _takbirTimer = _ucDefer('takbir', _occTk0, delayMs, function() { _playTakbirAuto(dur0, delay0); },
+                                'TAKBIR', 'M0');
         // Ampli ext ON : délai configuré (ucLightAmpliExtOnDelay) avant le démarrage audio
         if (JS_CUSTOM.ucLightAmpliExtOnEnabled == 1 && JS_CUSTOM.ucLightAmpliExtOffEnabled == 1) {
             var _onUrl = (JS_CUSTOM.ucLightAmpliExtOnUrl || '').trim();
@@ -19082,14 +19374,14 @@ function selectQPTakbir() {
                     parseInt(JS_CUSTOM.ucLightAmpliExtOnDelay, 10) || _TAKBIR_AMPLI_PRE_DELAY);
                 var _ampliOnMs = Math.max(0, (delay0 - _preDelay0)) * 1000;
                 if (_takbirAmpliOnTimer) { clearTimeout(_takbirAmpliOnTimer); _takbirAmpliOnTimer = null; }
-                _takbirAmpliOnTimer = setTimeout(function() {
+                _takbirAmpliOnTimer = _ucDefer('takbir', _occTk0, _ampliOnMs, function() {
                     _takbirAmpliOnTimer = null;
                     // Re-verifier au moment du tir (l'utilisateur peut avoir desactive entre-temps)
                     if (JS_CUSTOM.ucLightAmpliExtOnEnabled != 1 || JS_CUSTOM.ucLightAmpliExtOffEnabled != 1) return;
                     var _urlNow = (JS_CUSTOM.ucLightAmpliExtOnUrl || '').trim();
                     if (!_urlNow) return;
                     _ucHttpCall(_urlNow, 'ampliExtOn[takbir-M0]');
-                }, _ampliOnMs);
+                }, 'TAKBIR', 'ampliExtOn[M0]');
                 _L('TAKBIR','AMPLI_ON_SCHED',{mode:'M0',pre_delay:_preDelay0,ampli_ms:_ampliOnMs/1000+'s',url:_onUrl});
             }
         }
@@ -19176,7 +19468,8 @@ function selectQPTakbir() {
                 }
             }
             // Démarrer le takbir après _preDelay1 secondes
-            _takbirTimer = setTimeout(function() { _playTakbirAuto(dur1, delay1); }, _preDelay1 * 1000);
+            _takbirTimer = _ucDefer('takbir', _ucCaptureOcc('MGRB', 'takbir'), _preDelay1 * 1000,
+                                    function() { _playTakbirAuto(dur1, delay1); }, 'TAKBIR', 'M1');
         };
     })();
 
@@ -24327,6 +24620,10 @@ function selectQPTakbir() {
         var prayer = _ucCurrentPrayerKey();
         if (!_5PRAYERS[prayer]) {
             _L('PAD', 'SKIP', { item: 'postAzanDoua', prayer: prayer, reason: 'not_5prayers' });
+            return;
+        }
+        if (!_ucEventFresh('afterAzanHide')) {   // AZAN_HIDE rejoué bien après l'azan (rejeu resync) → caduc
+            _L('PAD', 'SKIP', { item: 'postAzanDoua', prayer: prayer, reason: 'stale_azan_hide' });
             return;
         }
         // Drapeau par cycle (cf. commentaire sur _padFiredThisCycle plus haut) :
