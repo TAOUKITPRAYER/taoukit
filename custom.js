@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.41';
+var CUSTOM_APP_VERSION = '14.42';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -4805,6 +4805,34 @@ var _UC_PRE_FAMILIES = { beforeAzan: 1, preAzanQuran: 1, finOgg: 1, takbir: 1 };
 
 function _ucNowMs() { return Date.now(); }
 
+// Minutes-depuis-minuit de l'azan d'une prière, lues depuis la table du cœur.
+// N'utilise PAS _ucPrayerMinutes (enfermé dans injectTechOptionsUI, invisible
+// ici — même piège que _ucPrayerNow, cf. commentaire de _ucCurrentPrayerKey) :
+// lecture directe de prayerTimesMinutesObject avec repli sur les globales *TimeInMinutes,
+// exactement comme _ucPrayerKeyFromClock() plus haut.
+function _ucPrayerMinutesSafe(key) {
+    var lk = (key === 'JOMOA') ? 'DOHR' : key;
+    // 1) table d'objet (vrai global, alimentée par m2body.js)
+    try {
+        var o = (typeof prayerTimesMinutesObject === 'object' && prayerTimesMinutesObject) ? prayerTimesMinutesObject : null;
+        var v = o ? o[lk] : undefined;
+        if (typeof v === 'number' && v > 0) return v;
+    } catch (e) {}
+    // 2) repli sur les globales `let` du cœur (accès par identifiant NU — elles
+    //    ne sont PAS des propriétés de window, cf. _ucComputeCurrentPrayerFromClock)
+    try {
+        var m = 0;
+        if      (lk === 'FAJR') m = (typeof fajrTimeInMinutes    === 'number') ? fajrTimeInMinutes    : 0;
+        else if (lk === 'SHRQ') m = (typeof shuruqTimeInMinutes  === 'number') ? shuruqTimeInMinutes  : 0;
+        else if (lk === 'DOHR') m = (typeof dohrTimeInMinutes    === 'number') ? dohrTimeInMinutes    : 0;
+        else if (lk === 'ASSR') m = (typeof asrTimeInMinutes     === 'number') ? asrTimeInMinutes     : 0;
+        else if (lk === 'MGRB') m = (typeof maghribTimeInMinutes === 'number') ? maghribTimeInMinutes : 0;
+        else if (lk === 'ISHA') m = (typeof ishaTimeInMinutes    === 'number') ? ishaTimeInMinutes    : 0;
+        if (m > 0) return m;
+    } catch (e) {}
+    return -1;
+}
+
 // Epoch (ms) de l'azan d'une prière AUJOURD'HUI depuis la table d'horaires.
 // Renvoie 0 si les horaires ne sont pas encore calculés (cold start) → la
 // péremption bascule alors sur un repli borné (cf. _ucOccValid), les gardes
@@ -4812,8 +4840,7 @@ function _ucNowMs() { return Date.now(); }
 function _ucPrayerAzanEpoch(key) {
     try {
         if (!key) return 0;
-        var lk = (key === 'JOMOA') ? 'DOHR' : key;   // pas de créneau propre côté cœur
-        var mins = (typeof _ucPrayerMinutes === 'function') ? _ucPrayerMinutes(lk) : -1;
+        var mins = _ucPrayerMinutesSafe(key);
         if (typeof mins !== 'number' || mins <= 0) return 0;
         var now = new Date();
         var mid = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
@@ -22645,21 +22672,27 @@ function selectQPTakbir() {
         if (!latEl || !lngEl) return;
         if ((latEl.value || '').trim() || (lngEl.value || '').trim()) return;
 
-        function _fillFromCity() {
+        function _cityPt() {
             try {
-                if ((latEl.value || '').trim() || (lngEl.value || '').trim()) return;
                 var cc = ((typeof JS_DATA !== 'undefined' && JS_DATA.ucNowCityCODE) || '').toLowerCase();
-                if (cc.indexOf('.') === -1) return;
+                if (cc.indexOf('.') === -1) return null;
                 var slug = cc.split('.')[1] || '';
                 var tbl  = window.UC_CITY_COORDS_TN || {};
                 var bare = slug.replace(/_+$/, '');
                 var pt   = tbl[slug] || tbl[bare] || tbl[bare + '_'];
-                if (pt && typeof pt.lat === 'number' && typeof pt.lng === 'number') {
-                    latEl.value = pt.lat.toFixed(6);
-                    lngEl.value = pt.lng.toFixed(6);
-                    if (typeof _L === 'function') _L('MPE', 'GEO_FILL', { src: 'city', slug: slug });
-                }
+                if (pt && typeof pt.lat === 'number' && typeof pt.lng === 'number') { pt.slug = slug; return pt; }
             } catch (e) {}
+            return null;
+        }
+
+        function _fillFromCity() {
+            if ((latEl.value || '').trim() || (lngEl.value || '').trim()) return;
+            var pt = _cityPt();
+            if (pt) {
+                latEl.value = pt.lat.toFixed(6);
+                lngEl.value = pt.lng.toFixed(6);
+                if (typeof _L === 'function') _L('MPE', 'GEO_FILL', { src: 'city', slug: pt.slug });
+            }
         }
 
         if (!navigator.geolocation) { _fillFromCity(); return; }
@@ -22667,6 +22700,26 @@ function selectQPTakbir() {
             navigator.geolocation.getCurrentPosition(
                 function (pos) {
                     if ((latEl.value || '').trim() || (lngEl.value || '').trim()) return;
+                    // La coordonnée doit être celle de la MOSQUÉE. La position de
+                    // l'appareil ne convient QUE si l'utilisateur est physiquement
+                    // dans la mosquée -- or une proposition est souvent envoyée de
+                    // chez soi / d'une autre ville (cas réel : جامع الصّابرين
+                    // proposée avec les coordonnées du domicile à Ksibet, mosquée
+                    // à 9 km à Monastir). Si la position de l'appareil est loin du
+                    // centre de la ville de calcul choisie, on la juge non fiable
+                    // et on retombe sur le centre-ville (approximation « bonne
+                    // ville », que l'admin affinera). Le bouton « 📍 Utiliser ma
+                    // position » reste disponible pour un placement explicite.
+                    var pt = _cityPt();
+                    if (pt && typeof _ucHaversineKm === 'function') {
+                        var d = _ucHaversineKm(pos.coords.latitude, pos.coords.longitude, pt.lat, pt.lng);
+                        if (d > 12) {
+                            latEl.value = pt.lat.toFixed(6);
+                            lngEl.value = pt.lng.toFixed(6);
+                            if (typeof _L === 'function') _L('MPE', 'GEO_FILL', { src: 'city_device_too_far', km: Math.round(d), slug: pt.slug });
+                            return;
+                        }
+                    }
                     latEl.value = pos.coords.latitude.toFixed(6);
                     lngEl.value = pos.coords.longitude.toFixed(6);
                     if (typeof _L === 'function') _L('MPE', 'GEO_FILL', { src: 'device' });
@@ -25111,6 +25164,34 @@ function selectQPTakbir() {
             alert(_cfgT('proposeCooldown'));
             return;
         }
+
+        // Garde-fou coordonnées : elles doivent être celles de la MOSQUÉE, pas
+        // de l'utilisateur. Si elles manquent, sont invalides, ou tombent loin
+        // du centre de la ville de calcul choisie (proposition envoyée de chez
+        // soi / d'une autre ville — cf. جامع الصّابرين placée à 9 km), on
+        // avertit explicitement avant l'envoi.
+        try {
+            var _lat = parseFloat(JS_CUSTOM.ucMosqueLat), _lng = parseFloat(JS_CUSTOM.ucMosqueLng);
+            var _geoWarn = '';
+            if (isNaN(_lat) || isNaN(_lng) || _lat === 0 || _lng === 0) {
+                _geoWarn = 'الإحداثيات الجغرافية للمسجد غير محدّدة.\nLes coordonnées GPS de la mosquée ne sont pas renseignées.';
+            } else {
+                var _cc = ((typeof JS_DATA !== 'undefined' && JS_DATA.ucNowCityCODE) || '').toLowerCase();
+                var _slug = _cc.indexOf('.') !== -1 ? _cc.split('.')[1] : '';
+                var _tbl = window.UC_CITY_COORDS_TN || {};
+                var _bare = _slug.replace(/_+$/, '');
+                var _pt = _tbl[_slug] || _tbl[_bare] || _tbl[_bare + '_'];
+                if (_pt && typeof _ucHaversineKm === 'function') {
+                    var _d = _ucHaversineKm(_lat, _lng, _pt.lat, _pt.lng);
+                    if (_d > 20) {
+                        _geoWarn = 'الإحداثيات تبعد حوالي ' + Math.round(_d) + ' كلم عن وسط المدينة المختارة — يجب أن تكون موضع المسجد لا موضعك.\n'
+                                 + 'Les coordonnées sont à ~' + Math.round(_d) + ' km du centre de la ville choisie — ce doit être la position de la MOSQUÉE, pas la vôtre.';
+                    }
+                }
+            }
+            if (_geoWarn && !confirm(_geoWarn + '\n\nالإرسال رغم ذلك؟ / Envoyer quand même ?')) return;
+        } catch (e) {}
+
         if (!confirm(_cfgT('proposeConfirm', { name: name }))) return;
 
         // Même correction que _pushRemoteBackup ci-dessous : priorité à la ville
