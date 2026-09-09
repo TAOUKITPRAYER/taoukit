@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.42';
+var CUSTOM_APP_VERSION = '14.43';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -38246,6 +38246,17 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
 // Récupération volontairement agressive (choix explicite) : pas d'exclusion
 // horaire, un seul palier de confirmation (délestage) avant le reload.
 // Garde-fou : 1 reload / 10 min max (sessionStorage). Boîtier uniquement.
+//
+// ── ESCALADE (incident box tn.monastir.youssef, 08-09/09/2026, X96Q_Max_P) ───
+// Un location.reload() ne corrige PAS un gel dû à un contexte GL perdu
+// (GL_UNKNOWN_CONTEXT_RESET_KHR en boucle) : le reload recharge le DOM dans le
+// MÊME process de rendu, donc le MÊME contexte GL mort. Ce jour-là le watchdog
+// a rechargé toutes les ~10 min pendant 16 h sans jamais dégeler l'écran.
+// Désormais : si un reload récent (< RELOAD_GAP_MS) n'a pas dégelé, on escalade
+// vers window.AndroidMobile.requestGpuRecoveryRestart() -> GpuRecovery redémarre
+// RÉELLEMENT le process (relance AlarmManager + kill), ce qui repart sur un
+// contexte GL neuf. Si le gel se répète, GpuRecovery latche le rendu logiciel
+// pour les démarrages suivants. Un gel de 16 h devient une coupure de ~10 s.
 // ═════════════════════════════════════════════════════════════════════════════
 (function _installRepaintWatchdog() {
     var _isBox = !!(window.AndroidMobile && typeof window.AndroidMobile.isAndroidTv === 'function'
@@ -38255,7 +38266,13 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
     var SHED_MS       = 6000;              // aucune frame depuis >6s -> délestage
     var HARD_MS       = 9000;              // toujours figé >9s -> location.reload()
     var RELOAD_GAP_MS = 10 * 60 * 1000;    // 1 reload / 10 min max
+    var NATIVE_GAP_MS = 60 * 1000;         // 1 demande de redémarrage natif / min max
     var CHECK_MS      = 1500;
+
+    // Escalade native disponible ? (natif à jour) — sinon on retombe sur
+    // l'ancien comportement "reload_suppressed_gap".
+    var _canNativeRestart = !!(window.AndroidMobile
+        && typeof window.AndroidMobile.requestGpuRecoveryRestart === 'function');
 
     function _now() {
         return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -38275,10 +38292,36 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         try { void document.documentElement.offsetHeight; } catch (e) {}   // reflow : peut vider un commit compositeur coincé
     }
 
+    // Escalade : le reload précédent n'a pas dégelé l'écran -> redémarrage
+    // réel du process côté natif (GpuRecovery). Throttlé à 1/min : GpuRecovery
+    // a lui-même un cooldown de 90 s, mais la boucle de vérification (1,5 s)
+    // rappellerait _reload() sans ça et spammerait le journal natif.
+    function _nativeRestart(stall, why) {
+        var lastN = 0;
+        try { lastN = parseInt(sessionStorage.getItem('UC_REPAINT_NATIVE_TS') || '0', 10) || 0; } catch (e) {}
+        if (lastN && Date.now() - lastN < NATIVE_GAP_MS) return;   // déjà demandé, on laisse le natif agir
+        try { sessionStorage.setItem('UC_REPAINT_NATIVE_TS', String(Date.now())); } catch (e) {}
+        _L('SYS', 'REPAINT_FROZEN', { stallMs: Math.round(stall), action: 'native_restart', why: why });
+        try {
+            if (window.AndroidMobile && typeof window.AndroidMobile.logPrayerEvent === 'function')
+                window.AndroidMobile.logPrayerEvent('SYS',
+                    'REPAINT_WATCHDOG_NATIVE_RESTART stallMs=' + Math.round(stall) + ' why=' + why);
+        } catch (e) {}
+        try {
+            window.AndroidMobile.requestGpuRecoveryRestart(
+                'repaint_frozen_' + why + '_' + Math.round(stall / 1000) + 's');
+        } catch (e) {}
+    }
+
     function _reload(stall) {
         var last = 0;
         try { last = parseInt(sessionStorage.getItem('UC_REPAINT_RELOAD_TS') || '0', 10) || 0; } catch (e) {}
-        if (Date.now() - last < RELOAD_GAP_MS) {
+
+        if (last && Date.now() - last < RELOAD_GAP_MS) {
+            // Un reload a déjà eu lieu récemment et l'écran est TOUJOURS figé :
+            // ce n'est pas un gel que le reload peut corriger (contexte GL
+            // perdu). On escalade vers un vrai redémarrage du process.
+            if (_canNativeRestart) { _nativeRestart(stall, 'reload_ineffective'); return; }
             _L('SYS', 'REPAINT_FROZEN', { stallMs: Math.round(stall), action: 'reload_suppressed_gap' });
             return;
         }
@@ -38320,7 +38363,12 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         if (stall >= HARD_MS) _reload(stall);
     }, CHECK_MS);
 
-    _L('CUSTOM', 'INIT', { item: 'repaintWatchdog', shedSec: SHED_MS / 1000, hardSec: HARD_MS / 1000 });
+    _L('CUSTOM', 'INIT', {
+        item: 'repaintWatchdog',
+        shedSec: SHED_MS / 1000,
+        hardSec: HARD_MS / 1000,
+        nativeEscalation: _canNativeRestart ? 1 : 0
+    });
 })();
 
 
