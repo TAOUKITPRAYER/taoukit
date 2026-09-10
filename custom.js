@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.43';
+var CUSTOM_APP_VERSION = '14.44';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -4785,10 +4785,17 @@ var _ucCycleSeq       = 0;    // +1 à chaque UC_EVT.AZAN_TIME (cf. handler diff
 var _ucCyclePrayerKey = '';   // prière annoncée par le dernier AZAN_TIME
 var _ucCycleStartedAt = 0;    // Date.now() du dernier AZAN_TIME
 
-// Fenêtre de validité (ms APRÈS l'epoch d'azan) par famille de déclencheur.
-// Tout ancré sur l'epoch d'azan (fiable) : les gardes clé-de-prière + cycle
-// font le travail fin, la péremption n'est qu'un filet contre les rejeux à
-// l'échelle de l'heure. Valeurs larges et volontairement généreuses.
+// Fenêtre de validité (ms APRÈS l'epoch de RÉFÉRENCE) par famille de
+// déclencheur. La référence est l'epoch d'azan pour les familles proches de
+// l'azan, MAIS l'epoch d'IQAMA (azan + délai iqama du jour) pour les familles
+// qui se produisent à/après l'iqama (cf. _UC_IQAMA_ANCHORED) : le délai
+// azan→iqama va de ~1 min à 70-80 min selon la mosquée/prière/saison —
+// notamment Dhuhr à heure d'iqama FIXE, où l'écart azan→iqama gonfle l'hiver
+// (aboubakr : azan Dhuhr ~11h55, iqama fixe 13h15 → ~80 min). aboubakr Fajr
+// = 30 min > l'ancien lag beforeIqama de 25 min → tout le programme iqama du
+// Fajr (et du Dhuhr) était rejeté « stale » chaque jour, incident 10/09/2026.
+// Les gardes clé-de-prière + cycle font le travail fin, la péremption n'est
+// qu'un filet contre les rejeux à l'échelle de l'heure. Valeurs généreuses.
 var _UC_TRIGGER_LAG = {
     beforeAzan:     3  * 60 * 1000,
     preAzanQuran:   3  * 60 * 1000,
@@ -4802,6 +4809,29 @@ var _UC_TRIGGER_LAG = {
 };
 // Familles évaluées AVANT l'azan (clé = prière à venir) plutôt qu'après.
 var _UC_PRE_FAMILIES = { beforeAzan: 1, preAzanQuran: 1, finOgg: 1, takbir: 1 };
+// Familles dont l'événement survient à/après l'iqama : leur fenêtre de
+// péremption est ancrée sur l'epoch d'iqama (= azanEpoch + délai iqama du
+// jour), pas sur celui de l'azan. afterBlackShow passe par la famille
+// 'beforeIqama' (cf. _installLightAfterBlackShow), donc couvert.
+var _UC_IQAMA_ANCHORED = { beforeIqama: 1, atIqamaZero: 1, afterBlackHide: 1 };
+
+// Délai iqama effectif (ms) d'une prière AUJOURD'HUI. JS_DATA.ucIqama<KEY> est
+// tenu à jour par le cœur : délai simple (bouton +/- borné à 70 min) OU, si
+// une heure d'iqama FIXE est configurée, (heure_fixe − heure_azan) — cette
+// voie-là N'EST PAS bornée (m2body.js ~L3475 : plancher 1, pas de plafond) et
+// peut légitimement valoir 70-80 min (Dhuhr l'hiver). Garde-fou 150 min :
+// au-delà = valeur aberrante → repli 0 (ancrage azan historique), comme pour
+// une valeur absente ou des horaires pas encore calculés.
+function _ucIqamaDelayMs(key) {
+    try {
+        var K = { FAJR: 'ucIqamaFAJR', SHRQ: 'ucIqamaSHRQ', DOHR: 'ucIqamaDOHR',
+                  ASSR: 'ucIqamaASSR', MGRB: 'ucIqamaMGRB', ISHA: 'ucIqamaISHA',
+                  JOMOA: 'ucIqamaDOHR' };
+        var m = parseInt((typeof JS_DATA === 'object' && JS_DATA) ? JS_DATA[K[key]] : NaN, 10);
+        if (isFinite(m) && m > 0 && m <= 150) return m * 60000;
+    } catch (e) {}
+    return 0;
+}
 
 function _ucNowMs() { return Date.now(); }
 
@@ -4896,12 +4926,16 @@ function _ucOccValid(ctx, delayMs) {
         return { ok: false, reason: 'cycle_changed', was: ctx.cycleSeq, now: _ucCycleSeq };
     }
 
-    // 3) Péremption
+    // 3) Péremption. Référence = epoch d'azan, décalé du délai iqama du jour
+    //    pour les familles ancrées iqama (le délai azan→iqama varie beaucoup
+    //    selon la mosquée — cf. _UC_IQAMA_ANCHORED).
     var lag = _UC_TRIGGER_LAG[ctx.family] || (20 * 60 * 1000);
     if (ctx.azanEpoch) {
-        if (_ucNowMs() > ctx.azanEpoch + lag) {
+        var ref = ctx.azanEpoch +
+            (_UC_IQAMA_ANCHORED[ctx.family] ? _ucIqamaDelayMs(ctx.prayerKey) : 0);
+        if (_ucNowMs() > ref + lag) {
             return { ok: false, reason: 'expired',
-                     ageMin: Math.round((_ucNowMs() - ctx.azanEpoch) / 60000) };
+                     ageMin: Math.round((_ucNowMs() - ref) / 60000) };
         }
     } else {
         // Epoch inconnu (cold start) : repli borné sur l'instant de capture.
@@ -4943,6 +4977,10 @@ function _ucEventFresh(family) {
     var cur = _ucCurrentPrayerKey();
     var epoch = _ucPrayerAzanEpoch(cur);
     if (!epoch) return true;   // horaires pas prêts → ne pas bloquer
+    // Familles à/après l'iqama : référence décalée du délai iqama du jour
+    // (sinon un Fajr à 30 min d'iqama tombe hors fenêtre dès rem≈0, alors que
+    // l'événement est parfaitement légitime — cf. _UC_IQAMA_ANCHORED).
+    if (_UC_IQAMA_ANCHORED[family]) epoch += _ucIqamaDelayMs(cur);
     var lag = _UC_TRIGGER_LAG[family] || (20 * 60 * 1000);
     // Écho périmé juste après un resync qui vient de tout nettoyer (même
     // précédent que jomoa_adab / _ucLastResyncCloseAt).
