@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.44';
+var CUSTOM_APP_VERSION = '14.45';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -4680,6 +4680,12 @@ function _lightPrayerAllowed(item, prayerKey) {
 
 // Dernière prière dont l'azan s'est affiché (pour afterAzanHide)
 let _lastAzanPrayer = '';
+
+// Epoch d'azan (ms) du dernier passage par showAzanPopup() — garde anti-double
+// du rattrapage d'écran azan au resync (_installIqamaCounterExactMinuteRestoreFix).
+// Sur window : écrit depuis le wrapper showAzanPopup (_ucInstallHooks), lu depuis
+// l'IIFE frère du fix. 0 = jamais affiché cette session.
+window._ucAzanPopupShownForEpoch = 0;
 
 // Calcul 100% autonome de la prière courante depuis l'horloge murale + le bloc
 // d'horaires du cœur (prayerTimesMinutesObject, rempli par m2body.js ~L3532 ;
@@ -11651,6 +11657,14 @@ function _ucPrayerMinutes(key) {
     const _origShowAzan = showAzanPopup;
     showAzanPopup = function(isDohaPrayer) {
         const prayer = _ucPrayerAtMinutes(currentTimeInMinutes);
+        // Mémorise l'epoch d'azan pour lequel la page a (tenté de) s'afficher :
+        // garde anti-double du rattrapage de resync (cf.
+        // _installIqamaCounterExactMinuteRestoreFix) — sans ça, rouvrir l'app
+        // pendant la minute d'azan après l'avoir déjà vue+fermée la ré-ouvrirait.
+        try {
+            if (typeof _ucPrayerAzanEpoch === 'function')
+                window._ucAzanPopupShownForEpoch = _ucPrayerAzanEpoch(prayer) || 0;
+        } catch (e) {}
         const evtData = { prayer:        prayer,
                           timeInMinutes: _ucPrayerMinutes(prayer),
                           isDohaPrayer:  !!isDohaPrayer };
@@ -17067,6 +17081,34 @@ function forceHijriSyncFunction() {
         if (_restoredPrayer) {
             showIqamaCounter();
             _L('RESYNC', 'COUNTER_EXACT_MINUTE_RESTORE', { prayer: _restoredPrayer, currentTimeInMinutes: currentTimeInMinutes });
+
+            // ── Rattrapage de la PAGE AZAN ────────────────────────────────
+            // Le cœur n'affiche l'écran azan que depuis le tick :00 exact
+            // (clockTickFunction → currentTimeInMinutes == heure_prière →
+            // showAzanPopup). Si le JS était en pause pendant ce tick (app en
+            // arrière-plan / écran éteint pendant la minute d'azan — courant
+            // sur téléphone récent, ex. SM-S938B), cet appel n'a jamais lieu :
+            // le compteur iqama est restauré ci-dessus, la page azan non.
+            // On la rattrape ICI, mais UNIQUEMENT pendant la minute d'horloge
+            // de l'azan (currentTimeInMinutes === heure_prière est déjà la
+            // condition de chaque branche → fenêtre ≤ 60 s, jamais d'azan
+            // rétroactif plusieurs minutes après). Gardes anti-double :
+            //  - page déjà visible (isAzanPopupVisible)
+            //  - azan déjà passé par showAzanPopup pour cet epoch (vu+fermé
+            //    puis réouverture dans la même minute) → _ucAzanPopupShownForEpoch
+            //  - fenêtre azan désactivée en réglages (ucShowAzanWindow == 0)
+            try {
+                var _azanVisible = (typeof isAzanPopupVisible !== 'undefined') && isAzanPopupVisible;
+                var _ep = (typeof _ucPrayerAzanEpoch === 'function') ? _ucPrayerAzanEpoch(_restoredPrayer) : 0;
+                var _alreadyRan = _ep && (window._ucAzanPopupShownForEpoch === _ep);
+                if (JS_DATA.ucShowAzanWindow == 1 && !_azanVisible && !_alreadyRan &&
+                    typeof showAzanPopup === 'function') {
+                    showAzanPopup(_restoredPrayer === 'SHRQ');
+                    _L('RESYNC', 'AZAN_POPUP_CATCHUP', { prayer: _restoredPrayer, currentTimeInMinutes: currentTimeInMinutes });
+                }
+            } catch (e) {
+                _L('RESYNC', 'AZAN_POPUP_CATCHUP_ERR', { err: (e && e.message) || String(e) });
+            }
         }
     };
 })();
