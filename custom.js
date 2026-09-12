@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.47';
+var CUSTOM_APP_VERSION = '14.48';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -13943,6 +13943,46 @@ window.SIMUL = (function() {
     }
 })();
 
+// ── Écran de verrouillage Tawkit (téléphone uniquement) ─────────────────────
+// Réglage "afficher Tawkit sur l'écran de verrouillage" (cf.
+// LockScreenPrefs/LockScreenActivity/LockScreenWatcherService, natif) :
+// case à cocher injectée juste après ucHrLayoutModeRow (demande explicite),
+// même pattern d'injection que _installLayoutModeSelector juste au-dessus.
+// _ucIsRealPhone (défini tout en haut de ce fichier) exclut les boîtiers TV,
+// pour lesquels ce réglage n'a aucun sens (toujours au premier plan par
+// conception, jamais verrouillés).
+(function _installLockScreenToggle() {
+    if (!_ucIsRealPhone) return;
+    if (!window.AndroidMobile || typeof window.AndroidMobile.setLockScreenModeEnabled !== 'function') return;
+
+    function _buildRow() {
+        if (document.getElementById('ucLockScreenRow')) return true; // deja injecte
+        var anchor = document.getElementById('ucHrLayoutModeRow');
+        if (!anchor || !anchor.parentNode) return false;
+
+        var row = document.createElement('div');
+        row.id = 'ucLockScreenRow';
+        row.innerHTML =
+            '<input type="checkbox" id="ucLockScreenCheckbox">' +
+            ' &nbsp;<label for="ucLockScreenCheckbox">إظهار توقيت على شاشة القفل</label>';
+        anchor.parentNode.insertBefore(row, anchor.nextSibling);
+
+        var cb = document.getElementById('ucLockScreenCheckbox');
+        try { cb.checked = !!window.AndroidMobile.isLockScreenModeEnabled(); } catch (e) {}
+        cb.addEventListener('change', function () {
+            try { window.AndroidMobile.setLockScreenModeEnabled(cb.checked); } catch (e) {}
+            _L('CUSTOM', 'LOCK_SCREEN_TOGGLE', { enabled: cb.checked });
+        });
+        return true;
+    }
+
+    if (!_buildRow()) {
+        document.addEventListener('DOMContentLoaded', function () {
+            if (!_buildRow()) setTimeout(_buildRow, 300);
+        });
+    }
+})();
+
 /* ── Swap Azan/Iqama : re-synchroniser quand le thème (mode) change ──────────
    Thème 1 exclu (cf. updateSwapAzanIqamaFunction) : si l'utilisateur revient
    au thème 1 pendant que la case est cochée, la classe swapAzanIqamaActive
@@ -14797,25 +14837,28 @@ function _forceHijriDisplayRefresh() {
 }
 
 // ── Démarrage / redémarrage du scheduler ─────────────────────────────────
-//  Ne saute la tentative immédiate QUE si la source officielle est déjà
-//  résolue pour aujourd'hui. Un cache salahhour seul (ex. hérité d'un jour
-//  où la source officielle n'existait pas encore, ou simplement d'une
-//  tentative précédente aujourd'hui où l'officiel était absent) ne doit
-//  jamais empêcher de retenter l'officiel au reload suivant.
+//  Affiche le cache local instantanément s'il couvre encore aujourd'hui
+//  (aucune attente réseau pour le premier rendu), MAIS lance dans tous les
+//  cas une vérification réseau juste après — ne diffère plus à 1h du matin
+//  quand le cache "semble" valide (BUG corrigé 12/09/2026 : un mois plein
+//  dont le dernier jour calculé coïncide avec le jour même où le mois
+//  suivant a été annoncé côté admin restait figé sur l'ancien mois jusqu'à
+//  1h — cas réel, Rabii Aouel démarré le 14/08 calculait encore un jour 30
+//  valide le 12/09, jour où Rabii Thani venait pourtant d'être saisi).
+//  _attemptHijriSync() gère lui-même toute la suite (succès → reprogrammé à
+//  1h ; rien de nouveau mais cache encore valide → conservé + retry 1h ;
+//  sinon → repli salahhour), donc rien d'autre à programmer ici.
 function _startHijriSyncScheduler() {
     if (JS_CUSTOM.ucHijriSyncEnabled != 1) return;
     if (_hijriSyncTimer) clearTimeout(_hijriSyncTimer);
 
-    // Calcul LOCAL d'abord (aucune attente réseau) : si la dernière ligne
-    // officielle connue couvre encore aujourd'hui, on l'affiche immédiatement.
     if (_computeOfficialToday(_hijriOfficialRaw)) {
-        dolog('[HijriSync] officiel (cache local) valide pour aujourd\'hui → affichage immédiat');
+        dolog('[HijriSync] officiel (cache local) valide pour aujourd\'hui → affichage immédiat + vérification réseau');
         _forceHijriDisplayRefresh();
-        _scheduleHijriSync(_msUntil1am(), 'synchro');
     } else {
         dolog('[HijriSync] source officielle non résolue localement pour aujourd\'hui → tentative réseau');
-        _attemptHijriSync();
     }
+    _attemptHijriSync();
 }
 
 // ── Override MiladiToHIJRI ────────────────────────────────────────────────
@@ -36166,7 +36209,7 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
     // directement ici, en fin de groupe "display", plutôt que d'ajouter un
     // 5e onglet.
     var GENERAL_GROUPS = [
-        { key: 'display', ids: ['ucHrLayoutModeRow', 'psFlagCheckbox', 'qrFlagCheckbox', 'use24HoursCheckbox', 'fullClockCheckbox', 'dateUpRightHrCheckbox', 'fullIqamaTimesCheckbox', 'fontsSettingsTitle', 'fontsTable'] },
+        { key: 'display', ids: ['ucHrLayoutModeRow', 'ucLockScreenRow', 'psFlagCheckbox', 'qrFlagCheckbox', 'use24HoursCheckbox', 'fullClockCheckbox', 'dateUpRightHrCheckbox', 'fullIqamaTimesCheckbox', 'fontsSettingsTitle', 'fontsTable'] },
         { key: 'table',   ids: ['showNightPrayersCheckbox', 'dimPastPrayersCheckbox', 'middleSalatNamesCheckbox', 'fiveBoxesOnlyCheckbox', 'hideIqamatCheckbox', 'middleVrNamesCheckbox', 'addZeroAmPmCheckbox', 'arabicDigitsCheckbox'] },
         { key: 'counter', ids: ['iqamaCounterCheckbox', 'fullScreenCounterCheckbox', 'lastMinuteCounterCheckbox', 'counterColorAlertCheckbox', 'bigNextPrayCounterCheckbox', 'showAzanScreenCheckbox', 'showIqamaScreenCheckbox', 'showMiniPrayerTimesTableCheckbox'] },
         { key: 'system',  ids: ['verifyInternetCheckbox', 'timesBgShadowsCheckbox', 'semiTransparentBgsCheckbox', 'noMobileReminderCheckbox'] }
