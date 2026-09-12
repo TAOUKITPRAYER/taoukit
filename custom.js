@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.46';
+var CUSTOM_APP_VERSION = '14.47';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -28635,6 +28635,29 @@ window._ucAddNotifHistory = _ucAddNotifHistory;
             else location.reload();
             return;
         }
+        // ── REDÉMARRAGE COMPLET DU BOÎTIER (pas juste la page) ───────────────
+        //   cf. MobileJsBridge.rebootDevice() (Kotlin) pour le detail : Device
+        //   Owner sinon root, avec plusieurs formes de `su` essayees (varie
+        //   selon la box). Retourne "" si aucune des deux voies n'est
+        //   disponible sur ce boitier -- on le journalise clairement plutot que
+        //   de laisser croire que la commande est partie pour rien.
+        if (action === 'reboot_box') {
+            var _rebootResult = '';
+            try {
+                if (window.AndroidMobile && typeof window.AndroidMobile.rebootDevice === 'function') {
+                    _rebootResult = window.AndroidMobile.rebootDevice();
+                }
+            } catch (e) {
+                _L('REMOTE_ACTION', 'EXEC_ERR', { action: 'reboot_box', reason: (e && e.message) || String(e) });
+                return;
+            }
+            if (_rebootResult) {
+                _L('REMOTE_ACTION', 'EXEC_OK', { action: 'reboot_box', method: _rebootResult });
+            } else {
+                _L('REMOTE_ACTION', 'EXEC_ERR', { action: 'reboot_box', reason: 'unavailable_no_device_owner_no_root' });
+            }
+            return;
+        }
         // ── AUDIO CORAN ─────────────────────────────────────────────────────
         //   quran_play / quran_stop : boutons dédiés (harmonisés avec les
         //   lumières on/off). quran_toggle : conservé (rétro-compat push).
@@ -29466,13 +29489,52 @@ window._ucAddNotifHistory = _ucAddNotifHistory;
     // (Coran/azan/lumières) ET évite qu'une 2e commande rapide n'écrase
     // pending_action avant que la box n'ait lu la 1re. Box sur secteur+wifi.
     var POLL_MS = 6000;
-    var _lastKnown; // undefined tant que _poll() n'a pas tourné une 1ère fois
     var _pollErrStreak = 0;
     var _lastPollAt = 0;
     var _SB_URL = (window.MOSQUE_CONFIG && window.MOSQUE_CONFIG.SUPABASE_URL)
                || 'https://tjmjmlzwzebocfdmifrg.supabase.co';
     var _SB_KEY = (window.MOSQUE_CONFIG && window.MOSQUE_CONFIG.SUPABASE_ANON_KEY)
                || 'sb_publishable_P9MMDcQw_mM4bLqCVCj_3A_tdTK5Tj4';
+
+    // Anti-rejeu (ne pas ré-exécuter deux fois la même demande) : PERSISTÉ en
+    // localStorage (par mosquée) depuis le 12/09/2026 -- BUG trouvé ce jour-là
+    // en diagnostiquant tn.monastir.hidaya : quand _lastKnown ne vivait qu'en
+    // mémoire JS, un simple reload de la page (sync config, watchdog GPU,
+    // self-reload réseau... tous fréquents sur une box) le remettait à
+    // `undefined`, et le 1er sondage suivant adoptait alors SILENCIEUSEMENT la
+    // ligne déjà en base comme "déjà connue" SANS l'exécuter (cf. commentaire
+    // "amorçage" ci-dessous) -- une action demandée juste avant un reload
+    // pouvait donc être perdue sans aucune trace ni erreur nulle part. En la
+    // persistant, un reload reprend exactement où le sondage précédent s'était
+    // arrêté : plus de fenêtre de perte.
+    function _lastKnownKey(mid) { return 'UC_RA_LAST_KNOWN::' + mid; }
+    function _loadLastKnown(mid) {
+        try { return localStorage.getItem(_lastKnownKey(mid)); } catch (e) { return null; }
+    }
+    function _saveLastKnown(mid, ts) {
+        try { localStorage.setItem(_lastKnownKey(mid), ts || ''); } catch (e) {}
+    }
+
+    // Acquitte la demande en base une fois exécutée -- SANS CA (bug pré-existant
+    // jusqu'au 12/09/2026), pending_action/pending_action_requested_at restent
+    // figés pour toujours sur la dernière demande, exécutée ou non : aucun moyen
+    // de distinguer depuis Supabase "traitée depuis longtemps" de "jamais vue"
+    // (box hors-ligne, ou perdue par le bug de rejeu ci-dessus). Un
+    // pending_action qui reste non-null durablement redevient alors un signal
+    // fiable d'anomalie réelle.
+    function _ackPendingAction(mid) {
+        fetch(_SB_URL + '/rest/v1/mosque_device_status?mosque_id=eq.' + encodeURIComponent(mid), {
+            method: 'PATCH',
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': _SB_KEY,
+                'Authorization': 'Bearer ' + _SB_KEY
+            },
+            body: JSON.stringify({ pending_action: null, pending_action_target: null, pending_action_requested_at: null })
+        }).catch(function (e) {
+            _L('REMOTE_ACTION', 'ACK_ERR', { mosque_id: mid, error: (e && e.message) || String(e) });
+        });
+    }
 
     function _poll() {
         // Wi-Fi/DNS de la box en vrac (window._ucNetStress) : espacer à 60s.
@@ -29492,21 +29554,24 @@ window._ucAddNotifHistory = _ucAddNotifHistory;
             if (_pollErrStreak) { _L('REMOTE_ACTION', 'POLL_RECOVERED', { afterErrors: _pollErrStreak }); _pollErrStreak = 0; }
             var row = rows && rows[0];
             var ts  = (row && row.pending_action_requested_at) || null;
-            // Amorçage silencieux au tout premier sondage (qu'une demande soit
-            // déjà en base ou non -- une demande déjà présente AVANT le
-            // démarrage de la box ne doit pas se redéclencher à chaque
-            // redémarrage) : _lastKnown vaut undefined uniquement ici, jamais
-            // après.
-            if (_lastKnown === undefined) {
-                _lastKnown = ts;
+            var _lastKnown = _loadLastKnown(mid);
+            // Amorçage silencieux au tout premier sondage APRÈS UNE INSTALLATION
+            // NEUVE (jamais rien de persisté pour cette mosquée) : une demande
+            // déjà présente en base avant même que la box n'ait tourné une
+            // seule fois ne doit pas se déclencher rétroactivement. Une fois
+            // persisté, ce cas ne se reproduit plus jamais pour cette mosquée
+            // (y compris après reload -- voir commentaire plus haut).
+            if (_lastKnown === null) {
+                _saveLastKnown(mid, ts);
                 return;
             }
             if (ts && ts !== _lastKnown && row.pending_action) {
                 var _lag = null;
                 try { _lag = Math.round((Date.now() - new Date(ts).getTime()) / 1000); } catch (e) {}
-                _lastKnown = ts;
+                _saveLastKnown(mid, ts);
                 _L('REMOTE_ACTION', 'POLL_DETECTED', { mosque_id: mid, action: row.pending_action, target: row.pending_action_target || '', lagSec: _lag });
                 window._ucDispatchRemoteAction(row.pending_action, row.pending_action_target || '');
+                _ackPendingAction(mid);
             }
         })
         .catch(function (e) {
@@ -34632,6 +34697,10 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         audioSyncing:     { AR: 'جارٍ مزامنة حالة المشغّل...',                  FR: 'Synchronisation du lecteur...',                          EN: 'Syncing player...' },
         actionSentOk:     { AR: 'تم الإرسال',                                  FR: 'Envoyé',                                                 EN: 'Sent' },
         reloadBtn:        { AR: 'إعادة تحميل الشاشة فقط',                       FR: 'Recharger la box uniquement',                            EN: 'Reload the box only' },
+        actRebootTitle:   { AR: 'إعادة تشغيل الجهاز',                          FR: 'Redémarrage complet',                                    EN: 'Full restart' },
+        actRebootBtn:     { AR: 'إعادة تشغيل الجهاز بالكامل',                  FR: 'Redémarrer la box',                                      EN: 'Reboot the box' },
+        rebootUnavailable:{ AR: 'إعادة التشغيل غير متاحة على هذا الجهاز',       FR: 'Redémarrage indisponible sur cette box',                 EN: 'Reboot unavailable on this box' },
+        rebootConfirm:    { AR: 'سيتوقف عرض الأوقات والصوت لمدة دقيقة تقريبًا. إعادة تشغيل الجهاز؟', FR: "L'affichage des horaires et le son s'arrêteront environ une minute. Redémarrer la box ?", EN: 'The prayer-time display and sound will stop for about a minute. Reboot the box?' },
         actDiagTitle:     { AR: 'التشخيص',                                     FR: 'Diagnostic',                                             EN: 'Diagnostics' },
         actSendDebug:     { AR: 'إرسال سجل التصحيح للمطوّر',                    FR: 'Envoyer le journal de debug au développeur',             EN: 'Send debug log to developer' },
         actUpdateTitle:   { AR: 'تحديث التطبيق',                               FR: 'Mise à jour de l’application',                       EN: 'App update' },
@@ -34795,6 +34864,9 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
                         // dans #ucRAActionsStatus tout en haut du panneau, hors champ
                         // de vision quand on agit en bas — retour imam 01/09/2026).
                         '<div id="ucRAReloadStatus" class="ucRALedStatus"></div>' +
+                        '<div class="ucRASectionTitle">' + _raT('actRebootTitle') + '</div>' +
+                        '<div class="ucRAActionsTop"><span id="ucRARebootBtn" class="ucModalBtn ucModalBtn--secondary">' + _raT('actRebootBtn') + '</span></div>' +
+                        '<div id="ucRARebootStatus" class="ucRALedStatus"></div>' +
                         '<div class="ucRASectionTitle">' + _raT('actUpdateTitle') + '</div>' +
                         '<div id="ucRAUpdateStatus" class="ucRAUpdateStatus">' + _raT('updateUnknown') + '</div>' +
                         '<div class="ucRAActionsTop"><span id="ucRAUpdateBtn" class="ucModalBtn ucModalBtn--secondary">' + _raT('actUpdateBtn') + '</span></div>' +
@@ -34854,6 +34926,14 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         // 30/07/2026). Combiné à la garde box-only du listener 'ucRemoteAction'
         // plus haut : aucun téléphone ne peut plus réagir à cette commande.
         document.getElementById('ucRAReloadBtn').addEventListener('click', function () { _sendRemoteAction('reload', null, _setReloadStatus); });
+        // Redémarrage COMPLET du boîtier (pas juste la page) -- seule action de
+        // ce panneau avec une confirmation : bien plus disruptif qu'un reload
+        // (coupure totale son+affichage ~1 min, cf. rebootConfirm) et sa
+        // disponibilité varie selon la box (cf. MobileJsBridge.rebootDevice).
+        document.getElementById('ucRARebootBtn').addEventListener('click', function () {
+            if (!window.confirm(_raT('rebootConfirm'))) return;
+            _sendRemoteAction('reboot_box', null, _setRebootStatus);
+        });
         // Bouton de synchro de la liste des récitateurs (onglet Paramétrage) --
         // pas de PIN : simple relecture (comme lights_refresh / audio_refresh).
         var _recBtn = document.getElementById('ucRARecitersSyncBtn');
@@ -35320,6 +35400,7 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         };
     }
     var _setReloadStatus       = _mkSectionStatusSetter('ucRAReloadStatus');
+    var _setRebootStatus       = _mkSectionStatusSetter('ucRARebootStatus');
     var _setUpdateActionStatus = _mkSectionStatusSetter('ucRAUpdateActionStatus');
     var _setDiagStatus         = _mkSectionStatusSetter('ucRADiagStatus');
 
@@ -35863,6 +35944,7 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         _setAudioStatus('', '');
         _setRecitersStatus('', '');
         _setReloadStatus('', '');
+        _setRebootStatus('', '');
         _setUpdateActionStatus('', '');
         _setDiagStatus('', '');
         _setPinNote('', false);
