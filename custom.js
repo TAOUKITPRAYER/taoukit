@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.48';
+var CUSTOM_APP_VERSION = '14.49';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -1711,7 +1711,7 @@ const JS_CUSTOM_DEFAULTS = {
     ucTakbirM1Enabled:           1,   // Mode 1 : auto-play takbir avant l'azan du Maghreb (AZAN_TIME)
     ucTakbirM1Delay:             1800,// secondes avant l'azan (mode 1) où le takbir démarre
     ucTakbirM1Duration:          900, // durée maximale (mode 1) de lecture du takbir (secondes, 0 = illimitée)
-    ucSilenceShortAlerts:         0,   // 1 = silence tous les sons beep/teet/drop/alert
+    ucSilenceShortAlerts:         0,   // 1 = silence tous les sons beep/teet/drop/alert + azan/iqama réels (reste 0 pour une INSTALL NEUVE -- l'activation par défaut cible uniquement les installs EXISTANTES qui se mettent à jour, cf. _ucMigrateSilenceAlertsDefaultOn)
     ucAlertByVoiceEnabled:        0,   // 1 = jouer spec/audio/alert_voice.ogg au BLACK_SHOW
     ucAlertByVoiceDelay:          12,
     // ── Onglet "الأذان والإشعارات" (modale Réglages) : alerte avant azan ────
@@ -9625,6 +9625,24 @@ function _qpSavePosition() {
     // sache s'il doit encore se rabattre sur canGoBack()/la boîte de dialogue.
     window._ucNativeBackClose = function() {
         return _ucCloseTopmostBackTarget(true);
+    };
+
+    // Appelé par MainActivity.registerLockScreenOffReceiver (ACTION_SCREEN_OFF,
+    // uniquement quand LockScreenPrefs.isEnabled) : ferme TOUTES les modales
+    // ouvertes d'un coup (pas juste la première), en rappelant
+    // _ucCloseTopmostBackTarget en boucle jusqu'à ce qu'il n'y ait plus rien à
+    // fermer -- exactement l'appui-retour répété nécessaire pour tout fermer.
+    // But : la couverture affichée par-dessus l'écran de verrouillage
+    // (LockScreenWatcherService/maybeActivateLockScreenGuard) montre la VRAIE
+    // WebView telle qu'elle était au moment du verrouillage -- sans ceci, une
+    // modale/section laissée ouverte (réglages, admin distant, console debug…)
+    // resterait visible par-dessus l'écran verrouillé au lieu du seul écran
+    // principal (demande explicite du 14/09/2026). consumeHistory=true à
+    // chaque itération : garde l'historique du WebView cohérent avec le
+    // nombre réel de modales fermées (même logique que _ucNativeBackClose).
+    window._ucCloseAllModalsForLockScreen = function() {
+        var guard = 0;
+        while (_ucCloseTopmostBackTarget(true) && guard < 50) guard++;
     };
 })();
 
@@ -26044,11 +26062,53 @@ function selectQPTakbir() {
 
 
 // ==========================================================================
+// -- MIGRATION : case "silence alertes" activée par défaut pour les
+//    installs EXISTANTES qui se mettent à jour (v14.49) ---------------------
+// JS_CUSTOM_DEFAULTS ci-dessus n'est appliqué que pour les clés ABSENTES du
+// localStorage (Object.assign(defaults, storedValues)) -- un utilisateur
+// existant a déjà ucSilenceShortAlerts=0 persisté (défaut d'avant cette
+// version), donc changer la valeur par défaut ne le concerne jamais tout
+// seul. Migration one-shot (comme _ucRenumberCustomThemes plus haut), gardée
+// par un flag localStorage dédié plutôt que par CUSTOM_APP_VERSION : ne se
+// redéclenche pas après un downgrade/re-upgrade. N'affecte PAS une install
+// neuve (JS_CUSTOM_DEFAULTS.ucSilenceShortAlerts reste 0 pour elle).
+(function _ucMigrateSilenceAlertsDefaultOn() {
+    var FLAG = 'UC_MIGRATED_SILENCE_ALERTS_DEFAULT_ON_V1';
+    try {
+        if (localStorage.getItem(FLAG) === '1') return;
+        localStorage.setItem(FLAG, '1');
+        if (JS_CUSTOM.ucSilenceShortAlerts != 1) {
+            JS_CUSTOM.ucSilenceShortAlerts = 1;
+            if (typeof saveCustomSettingsFunction === 'function') saveCustomSettingsFunction();
+            if (typeof _L === 'function') _L('CFG', 'MIGRATE', {ucSilenceShortAlerts: 1, reason: 'default_on_v14.49'});
+        }
+    } catch (e) {}
+})();
+
+// ==========================================================================
 // -- SILENCE ALERTES COURTES -----------------------------------------------
+// Étendu pour couvrir aussi l'azan/iqama réels (pas seulement les bips) :
+// 'audio_azan'/'audio_fajr' (azan complet), 'short_azan' (azan court),
+// 'short_iqama' (iqama courte). Côté JS ceci ne suffit PAS sur l'APK pour le
+// mode "voix complète" -- le <audio> correspondant y est déjà coupé (muted)
+// et le son réel vient de AzanPlaybackService (natif, MediaPlayer, tourne
+// même appli fermée) : cf. _syncSilenceToNative ci-dessous + PREF_SILENCE_
+// ALERTS côté Kotlin, seul garde-fou qui couvre vraiment ce cas.
 (function _installSilenceShortAlerts() {
-    var _SILENT_KEYS = ['wbeeep', 'wteet', 'w1drop', 'w3drop', 'alert1', 'w3alerts'];
-    var _SILENT_IDS  = ['audioBeepElement','audioTeetElement','audioDrop1Element','audioDrop3Element','audioAlert1Element','audioAlertsElement'];
+    var _SILENT_KEYS = ['wbeeep', 'wteet', 'w1drop', 'w3drop', 'alert1', 'w3alerts', 'audio_azan', 'audio_fajr', 'short_azan', 'short_iqama'];
+    var _SILENT_IDS  = ['audioBeepElement','audioTeetElement','audioDrop1Element','audioDrop3Element','audioAlert1Element','audioAlertsElement','audioAzanElement','audioFajrElement','audioShortAzanElement','audioShortIqamaElement'];
     function _isActive() { return JS_CUSTOM.ucSilenceShortAlerts == 1; }
+    // Miroir natif (SharedPreferences, cf. MobileJsBridge.syncSilenceAlertsFlag) :
+    // AzanPlaybackService relit ce flag au tout dernier moment avant de jouer
+    // le son réel de l'azan (MediaPlayer, indépendant de ce <audio> JS) --
+    // garantit qu'aucun son n'est émis nativement non plus quand la case est
+    // cochée, y compris appli fermée/arrière-plan. Même schéma que
+    // setFlipToMuteEnabled (_ucToggleFlipToMuteAzan).
+    function _syncSilenceToNative() {
+        if (window.AndroidMobile && typeof window.AndroidMobile.syncSilenceAlertsFlag === 'function') {
+            window.AndroidMobile.syncSilenceAlertsFlag(_isActive());
+        }
+    }
     function _patchElements() {
         _SILENT_IDS.forEach(function(id) {
             var el = document.getElementById(id);
@@ -26077,7 +26137,7 @@ function selectQPTakbir() {
         var parentDiv = ref.closest ? ref.closest('div') : ref.parentNode;
         if (!parentDiv) return;
         var newDiv = document.createElement('div');
-        newDiv.innerHTML = "<input type='checkbox' id='ucSilenceAlertsCheckbox' onchange='window._ucToggleSilenceAlerts();'>&nbsp;<label for='ucSilenceAlertsCheckbox' style='cursor:pointer;'>تعطيل التنبيهات الصوتية القصيرة</label>";
+        newDiv.innerHTML = "<input type='checkbox' id='ucSilenceAlertsCheckbox' onchange='window._ucToggleSilenceAlerts();'>&nbsp;<label for='ucSilenceAlertsCheckbox' style='cursor:pointer;'>تعطيل التنبيهات الصوتية </label>";
         parentDiv.insertAdjacentElement('afterend', newDiv);
         document.getElementById('ucSilenceAlertsCheckbox').checked = _isActive();
     }
@@ -26086,10 +26146,12 @@ function selectQPTakbir() {
         saveCustomSettingsFunction();
         var cb = document.getElementById('ucSilenceAlertsCheckbox');
         if (cb) cb.checked = _isActive();
+        _syncSilenceToNative();
         _L('CFG','SET',{ucSilenceShortAlerts:JS_CUSTOM.ucSilenceShortAlerts});
     };
     _patchElements();
     _injectCheckbox();
+    _syncSilenceToNative();
 })();
 
 // ==========================================================================
@@ -31874,6 +31936,17 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
             JS_DATA.ucAzanIqamaByVoice == 1,
             JS_DATA.ucShortAzanActive == 1
         );
+
+        // Case "تعطيل التنبيهات الصوتية " (_installSilenceShortAlerts,
+        // ucSilenceAlertsCheckbox) -- re-synchronise ici aussi (pas seulement au
+        // moment du clic) pour couvrir les chemins qui changent JS_CUSTOM sans
+        // passer par _ucToggleSilenceAlerts (ex. restauration d'une config
+        // distante/backup_json). Prioritaire cote natif sur tout le reste (voir
+        // AzanPlaybackService.PREF_SILENCE_ALERTS) : aucun son, azan complet
+        // inclus, tant que coche.
+        if (typeof window.AndroidMobile.syncSilenceAlertsFlag === 'function') {
+            window.AndroidMobile.syncSilenceAlertsFlag(JS_CUSTOM.ucSilenceShortAlerts == 1);
+        }
 
         // Miroir natif de JS_CUSTOM.ucAzanVoiceEnabledXxx (modale "تفعيل الأذان
         // حسب الصلاة", cf. injectAzanCatalogFeature plus bas dans ce fichier) --
@@ -37824,14 +37897,15 @@ var SUPABASE_KEEPALIVE_ENABLED = true;
         },
         {
             id: 'silence_short_alerts',
-            kw: ['تعطيل التنبيهات الصوتية القصيرة', 'ايقاف صوت التنبيه القصير', 'كتم اصوات البيب',
-                 'desactiver alertes sonores courtes', 'couper bips application', 'silence sons courts',
-                 'disable short beep sounds', 'mute short alert sounds', 'turn off beep sounds'],
-            chip: { AR: 'كيف أعطّل الأصوات القصيرة (البيب)؟', FR: 'Comment désactiver les bips courts ?', EN: 'How to disable the short beep sounds?' },
+            kw: ['تعطيل التنبيهات الصوتية', 'ايقاف صوت التنبيه', 'كتم اصوات البيب', 'كتم صوت الأذان',
+                 'desactiver alertes sonores', 'couper bips application', 'silence sons courts',
+                 'couper le son de l\'azan', 'mute azan sound',
+                 'disable sound alerts', 'mute alert sounds', 'turn off beep sounds'],
+            chip: { AR: 'كيف أعطّل كل الأصوات (بيب والأذان)؟', FR: 'Comment couper tous les sons (bips et azan) ?', EN: 'How to mute all sounds (beeps and azan)?' },
             answer: {
-                AR: 'من "الإعدادات > تنبيهات"، فعّل خانة "تعطيل التنبيهات الصوتية القصيرة" لكتم أصوات التنبيه القصيرة (البيب) في التطبيق دون التأثير على صوت الأذان نفسه.',
-                FR: 'Depuis "Réglages > Alertes", activez "Désactiver les alertes sonores courtes" pour couper les petits bips de l\'application, sans toucher au son de l\'azan lui-même.',
-                EN: 'From "Settings > Alerts", enable "Disable short sound alerts" to mute the app\'s short beep sounds, without affecting the azan sound itself.'
+                AR: 'من "الإعدادات > تنبيهات"، فعّل خانة "تعطيل التنبيهات الصوتية" لكتم كل أصوات التنبيه في التطبيق، بما في ذلك صوت الأذان والإقامة نفسه.',
+                FR: 'Depuis "Réglages > Alertes", activez "Désactiver les alertes sonores" pour couper tous les sons de l\'application, y compris le son de l\'azan et de l\'iqama eux-mêmes.',
+                EN: 'From "Settings > Alerts", enable "Disable sound alerts" to mute all the app\'s alert sounds, including the azan and iqama sound itself.'
             },
             action: function () { _openOptionsTab('alert'); }
         },
