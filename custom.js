@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.52';
+var CUSTOM_APP_VERSION = '14.53';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -17238,6 +17238,89 @@ function forceHijriSyncFunction() {
     };
 })();
 
+// ── FIX 16/09/2026 (signalé par l'utilisateur : après un reload pendant la
+//    prière du Dohr, le compte à rebours restauré affichait ~1 min de PLUS
+//    que l'écart réel horloge->iqama) :
+//
+//    checkAndRestoreIqamaCounter() (cœur, ET notre propre
+//    _installIqamaCounterExactMinuteRestoreFix ci-dessus, même schéma) calcule
+//    le nombre de minutes restantes ainsi :
+//        remainingIqamaMinutes = (dohrTimeInMinutes + ucIqamaDOHR) - currentTimeInMinutes;
+//        startIqamaCounterFunction(remainingIqamaMinutes, ..., ...);
+//    puis DANS startIqamaCounterFunction (cœur, m2body.js ~L3750) :
+//        currentSecondsComp = new Date().getSeconds();   // lecture FRAÎCHE
+//        remainingSeconds = (iqamaMinutes * 60) - currentSecondsComp;
+//
+//    currentTimeInMinutes n'est mis à jour qu'UNE FOIS PAR SECONDE par
+//    clockTickFunction (setInterval 1000ms, m2body.js ~L2156) -- il peut donc
+//    être vieux de presque 1 seconde au moment où le calcul ci-dessus
+//    s'exécute. Si la minute d'horloge change PENDANT cet écart (ex.
+//    currentTimeInMinutes encore "12:48" alors qu'il est en réalité 12:49:00.05),
+//    remainingIqamaMinutes est calculé avec la minute PRÉCÉDENTE tandis que
+//    currentSecondsComp (lu séparément, activation quasi-immédiate) reflète
+//    déjà la nouvelle minute -- les deux lectures ne sont plus cohérentes,
+//    l'écart résultant peut atteindre PRESQUE 1 MINUTE DE TROP. Rare (fenêtre
+//    d'environ 1 seconde par minute) mais reproductible sur n'importe quel
+//    reload/reprise -- exactement le symptôme rapporté.
+//
+//    Corrigé en recalculant nous-mêmes iqamaMinutes avec une lecture FRAÎCHE
+//    de l'horloge, juste avant l'appel réel -- élimine l'écart entre les deux
+//    lectures. La prière concernée est identifiée via une comparaison DE
+//    PLAGE (dizaines de minutes de large, donc insensible à la même
+//    staleness de ~1s) plutôt que par la valeur exacte de forcedCounterSeconds
+//    (qui pourrait coïncider entre deux prières si leurs délais d'iqama sont
+//    configurés à la même valeur). Ne s'applique qu'aux appels de
+//    RESTAURATION (forcedCounterSeconds > 0) -- le déclenchement normal à
+//    l'heure pile (forcedCounterSeconds == 0) n'est jamais concerné, il
+//    n'implique aucune soustraction de ce type.
+(function _fixIqamaMinutesStaleness() {
+    if (typeof window.startIqamaCounterFunction !== 'function') return;
+    var _origStartIqamaCounter3 = window.startIqamaCounterFunction;
+    window.startIqamaCounterFunction = function (iqamaMinutes, prayerDuration, forcedCounterSeconds) {
+        try {
+            if (typeof forcedCounterSeconds === 'number' && forcedCounterSeconds > 0 &&
+                typeof currentTimeInMinutes !== 'undefined') {
+                var _target = null;
+                if (typeof fajrTimeInMinutes !== 'undefined' && JS_DATA.ucIqamaFAJR > 0 &&
+                    currentTimeInMinutes >= fajrTimeInMinutes && currentTimeInMinutes < fajrTimeInMinutes + JS_DATA.ucIqamaFAJR) {
+                    _target = fajrTimeInMinutes + JS_DATA.ucIqamaFAJR;
+                } else if (typeof shuruqTimeInMinutes !== 'undefined' && JS_DATA.ucIqamaSHRQ > 0 &&
+                    currentTimeInMinutes >= shuruqTimeInMinutes && currentTimeInMinutes < shuruqTimeInMinutes + JS_DATA.ucIqamaSHRQ) {
+                    _target = shuruqTimeInMinutes + JS_DATA.ucIqamaSHRQ;
+                } else if (typeof dohrTimeInMinutes !== 'undefined' && JS_DATA.ucIqamaDOHR > 0 &&
+                    currentTimeInMinutes >= dohrTimeInMinutes && currentTimeInMinutes < dohrTimeInMinutes + JS_DATA.ucIqamaDOHR) {
+                    _target = dohrTimeInMinutes + JS_DATA.ucIqamaDOHR;
+                } else if (typeof asrTimeInMinutes !== 'undefined' && JS_DATA.ucIqamaASSR > 0 &&
+                    currentTimeInMinutes >= asrTimeInMinutes && currentTimeInMinutes < asrTimeInMinutes + JS_DATA.ucIqamaASSR) {
+                    _target = asrTimeInMinutes + JS_DATA.ucIqamaASSR;
+                } else if (typeof maghribTimeInMinutes !== 'undefined' && JS_DATA.ucIqamaMGRB > 0 &&
+                    currentTimeInMinutes >= maghribTimeInMinutes && currentTimeInMinutes < maghribTimeInMinutes + JS_DATA.ucIqamaMGRB) {
+                    _target = maghribTimeInMinutes + JS_DATA.ucIqamaMGRB;
+                } else if (typeof ishaTimeInMinutes !== 'undefined' && JS_DATA.ucIqamaISHA > 0 &&
+                    currentTimeInMinutes >= ishaTimeInMinutes && currentTimeInMinutes < ishaTimeInMinutes + JS_DATA.ucIqamaISHA) {
+                    _target = ishaTimeInMinutes + JS_DATA.ucIqamaISHA;
+                }
+
+                if (_target !== null) {
+                    var _now = new Date();
+                    var _freshCurrentTimeInMinutes = (_now.getHours() * 60) + _now.getMinutes();
+                    var _freshIqamaMinutes = _target - _freshCurrentTimeInMinutes;
+                    if (_freshIqamaMinutes > 0 && _freshIqamaMinutes !== iqamaMinutes) {
+                        _L('IQAMA', 'FIX_STALE_MINUTES', {
+                            from: iqamaMinutes, to: _freshIqamaMinutes,
+                            cachedNow: currentTimeInMinutes, freshNow: _freshCurrentTimeInMinutes, target: _target
+                        });
+                        iqamaMinutes = _freshIqamaMinutes;
+                    }
+                }
+            }
+        } catch (e) {
+            _L('IQAMA', 'FIX_STALE_MINUTES_ERR', { err: (e && e.message) || String(e) });
+        }
+        return _origStartIqamaCounter3.apply(this, [iqamaMinutes, prayerDuration, forcedCounterSeconds]);
+    };
+})();
+
 // ── DIAGNOSTIC : trace l'état des conteneurs à chaque appel de
 //    showIqamaCounter() -- conservé après le fix ci-dessus pour confirmer en
 //    conditions réelles qu'aucun autre chemin ne reproduit encore le
@@ -26136,15 +26219,57 @@ function selectQPTakbir() {
 // par un flag localStorage dédié plutôt que par CUSTOM_APP_VERSION : ne se
 // redéclenche pas après un downgrade/re-upgrade. N'affecte PAS une install
 // neuve (JS_CUSTOM_DEFAULTS.ucSilenceShortAlerts reste 0 pour elle).
+//
+// GARDE-FOU AJOUTÉ 16/09/2026 (incident réel : boîtiers tn.raoued.nour-chaker
+// ET tn.monastir.hidaya, azan réel silencieux pour Asr/Maghreb/Isha le jour
+// même de leur mise à jour vers 14.49+) : cette migration n'avait été pensée
+// que pour un usage TÉLÉPHONE PERSONNEL -- sur un BOÎTIER DE MOSQUÉE EN
+// PRODUCTION, couper "tous les sons y compris l'azan" par défaut va
+// exactement à l'encontre du but de l'app. Ne s'applique donc plus JAMAIS
+// sur boîtier (cf. _ucRevertSilenceAlertsMigrationOnBox juste en dessous
+// pour la correction des boîtiers déjà touchés AVANT ce garde-fou).
 (function _ucMigrateSilenceAlertsDefaultOn() {
     var FLAG = 'UC_MIGRATED_SILENCE_ALERTS_DEFAULT_ON_V1';
     try {
         if (localStorage.getItem(FLAG) === '1') return;
         localStorage.setItem(FLAG, '1');
+        var _isBoxDevice = !!(window.AndroidMobile && typeof window.AndroidMobile.isAndroidTv === 'function'
+            && window.AndroidMobile.isAndroidTv());
+        if (_isBoxDevice) return;
         if (JS_CUSTOM.ucSilenceShortAlerts != 1) {
             JS_CUSTOM.ucSilenceShortAlerts = 1;
             if (typeof saveCustomSettingsFunction === 'function') saveCustomSettingsFunction();
             if (typeof _L === 'function') _L('CFG', 'MIGRATE', {ucSilenceShortAlerts: 1, reason: 'default_on_v14.49'});
+        }
+    } catch (e) {}
+})();
+
+// ── CORRECTIF URGENT 16/09/2026 : annule l'effet de la migration ci-dessus
+//    sur tout boîtier DÉJÀ touché avant l'ajout du garde-fou -- l'azan réel
+//    diffusé aux fidèles a été coupé (AzanPlaybackService.NATIVE_SKIP_SILENCED,
+//    ampli allumé via Shelly mais aucun son joué) pour Asr/Maghreb/Isha sur au
+//    moins 2 boîtiers de mosquée en production le 16/09/2026. One-shot, gardé
+//    par son propre flag. Ne touche QUE les boîtiers où c'est NOTRE migration
+//    (pas un choix délibéré d'un admin -- distingué par le flag de la
+//    migration elle-même) qui a mis ucSilenceShortAlerts à 1 : un admin qui
+//    coche volontairement cette case sur un boîtier APRÈS ce correctif n'est
+//    plus jamais touché (ce correctif ne s'exécute qu'une fois, tout court).
+(function _ucRevertSilenceAlertsMigrationOnBox() {
+    var FLAG = 'UC_REVERTED_SILENCE_ALERTS_BOX_MIGRATION_V1';
+    try {
+        if (localStorage.getItem(FLAG) === '1') return;
+        localStorage.setItem(FLAG, '1');
+        var _isBoxDevice = !!(window.AndroidMobile && typeof window.AndroidMobile.isAndroidTv === 'function'
+            && window.AndroidMobile.isAndroidTv());
+        if (!_isBoxDevice) return;
+        var _wasOurMigration = localStorage.getItem('UC_MIGRATED_SILENCE_ALERTS_DEFAULT_ON_V1') === '1';
+        if (_wasOurMigration && JS_CUSTOM.ucSilenceShortAlerts == 1) {
+            JS_CUSTOM.ucSilenceShortAlerts = 0;
+            if (typeof saveCustomSettingsFunction === 'function') saveCustomSettingsFunction();
+            if (window.AndroidMobile && typeof window.AndroidMobile.syncSilenceAlertsFlag === 'function') {
+                window.AndroidMobile.syncSilenceAlertsFlag(false);
+            }
+            if (typeof _L === 'function') _L('CFG', 'REVERT_SILENCE_MIGRATION_BOX', { reason: 'mosque_box_azan_must_not_be_silenced' });
         }
     } catch (e) {}
 })();
