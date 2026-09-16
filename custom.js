@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.51';
+var CUSTOM_APP_VERSION = '14.52';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -17123,15 +17123,23 @@ function forceHijriSyncFunction() {
             positionHighlightBar(prayerRowShrqVerticalElement, prayerCellShrqHorizontalElement);
             _restoredPrayer = 'SHRQ';
         } else if (currentTimeInMinutes === dohrTimeInMinutes && JS_DATA.ucIqamaDOHR > 0) {
-            startIqamaCounterFunction(JS_DATA.ucIqamaDOHR, JS_DATA.ucIqamaDOHR, JS_DATA.ucIqamaDOHR);
+            // 2e argument = duree de priere (JS_DATA.ucPrayDurationDOHR, ex. 9 min),
+            // PAS le delai azan->iqama (ucIqamaDOHR, ex. 39 min) -- meme bug que
+            // celui du coeur corrige ci-dessous par _fixCheckAndRestoreIqamaCounterDuration
+            // (copie-collee ici par erreur a l'origine). Sans ce correctif,
+            // onIqamaEndFunction()/deactivateBlackScreen() (m2body.js) attend
+            // ucIqamaDOHR minutes au lieu de ucPrayDurationDOHR -> rideau noir qui
+            // ne se referme jamais tout seul (bug reel constate 16/09/2026, boitier
+            // tn.raoued.nour-chaker).
+            startIqamaCounterFunction(JS_DATA.ucIqamaDOHR, JS_DATA.ucPrayDurationDOHR, JS_DATA.ucIqamaDOHR);
             positionHighlightBar(prayerRowDohrVerticalElement, prayerCellDohrHorizontalElement);
             _restoredPrayer = 'DOHR';
         } else if (currentTimeInMinutes === asrTimeInMinutes && JS_DATA.ucIqamaASSR > 0) {
-            startIqamaCounterFunction(JS_DATA.ucIqamaASSR, JS_DATA.ucIqamaASSR, JS_DATA.ucIqamaASSR);
+            startIqamaCounterFunction(JS_DATA.ucIqamaASSR, JS_DATA.ucPrayDurationASSR, JS_DATA.ucIqamaASSR);
             positionHighlightBar(prayerRowAsrVerticalElement, prayerCellAsrHorizontalElement);
             _restoredPrayer = 'ASSR';
         } else if (currentTimeInMinutes === maghribTimeInMinutes && JS_DATA.ucIqamaMGRB > 0) {
-            startIqamaCounterFunction(JS_DATA.ucIqamaMGRB, JS_DATA.ucIqamaMGRB, JS_DATA.ucIqamaMGRB);
+            startIqamaCounterFunction(JS_DATA.ucIqamaMGRB, JS_DATA.ucPrayDurationMGRB, JS_DATA.ucIqamaMGRB);
             positionHighlightBar(prayerRowMgrbVerticalElement, prayerCellMgrbHorizontalElement);
             _restoredPrayer = 'MGRB';
         } else if (currentTimeInMinutes === ishaTimeInMinutes && JS_DATA.ucIqamaISHA > 0) {
@@ -17171,6 +17179,62 @@ function forceHijriSyncFunction() {
                 _L('RESYNC', 'AZAN_POPUP_CATCHUP_ERR', { err: (e && e.message) || String(e) });
             }
         }
+    };
+})();
+
+// ── FIX 16/09/2026 (bug réel constaté boîtier tn.raoued.nour-chaker : rideau
+//    noir jamais refermé automatiquement après Dohr, attendait ~39 min au
+//    lieu de ~9 min — fermé seulement par un clic manuel) :
+//
+//    checkAndRestoreIqamaCounter() du CŒUR (m2body.js, ~L8233-8280) passe
+//    JS_DATA.ucIqamaDOHR/ASSR/MGRB (délai azan->iqama, ex. 39 min) comme 2e
+//    argument (prayerDuration) de startIqamaCounterFunction() au lieu de
+//    JS_DATA.ucPrayDurationDOHR/ASSR/MGRB (durée de prière après iqama, ex.
+//    9 min) -- copier-coller visiblement erroné : les cas FAJR/ISHA de la
+//    MÊME fonction cœur utilisent bien ucPrayDurationXXX, seuls DOHR/ASSR/MGRB
+//    sont affectés. prayerDuration devient prayerDurationMinutes (m2body.js),
+//    qui pilote setTimeout('onIqamaEndFunction()', prayerDurationMinutes*60000)
+//    -> deactivateBlackScreen() : avec la mauvaise valeur, le rideau noir
+//    attend le délai azan->iqama complet au lieu de la durée de prière.
+//
+//    Ce chemin cœur se déclenche uniquement lors d'une RESTAURATION (page
+//    rechargée/relancée pendant la fenêtre azan->iqama déjà en cours -- ex.
+//    16/09/2026 : boîtier sorti du premier plan avant l'azan, relancé
+//    manuellement ~13 min avant l'iqama), jamais lors du déclenchement normal
+//    à l'heure pile (m2body.js ~L2221, qui utilise déjà ucPrayDurationDOHR
+//    correctement) -- explique le caractère intermittent, sans lien avec le
+//    fix _installIqamaCounterExactMinuteRestoreFix ci-dessus (bug distinct,
+//    même copier-coller, corrigé séparément à sa propre source juste au-dessus).
+//
+//    Impossible de corriger m2body.js (fichier cœur, règle d'or) : on
+//    intercepte donc startIqamaCounterFunction() lui-même, point de passage
+//    commun à TOUS les appelants (cœur ET nos propres patches). Signature du
+//    bug : le 2e argument (prayerDuration) est égal au 3e (forcedCounterSeconds)
+//    -- vrai UNIQUEMENT pour cet appel bugué ; tout appel légitime a soit un
+//    3e argument = 0 (déclenchement normal), soit un 2e argument DIFFÉRENT du
+//    3e (ucPrayDurationXXX vs ucIqamaXXX, valeurs distinctes en pratique).
+(function _fixCheckAndRestoreIqamaCounterDuration() {
+    if (typeof window.startIqamaCounterFunction !== 'function') return;
+    var _origStartIqamaCounter2 = window.startIqamaCounterFunction;
+    var _WRONG_TO_RIGHT_DURATION = [
+        ['ucIqamaDOHR', 'ucPrayDurationDOHR'],
+        ['ucIqamaASSR', 'ucPrayDurationASSR'],
+        ['ucIqamaMGRB', 'ucPrayDurationMGRB']
+    ];
+    window.startIqamaCounterFunction = function (iqamaMinutes, prayerDuration, forcedCounterSeconds) {
+        for (var i = 0; i < _WRONG_TO_RIGHT_DURATION.length; i++) {
+            var wrongKey = _WRONG_TO_RIGHT_DURATION[i][0], rightKey = _WRONG_TO_RIGHT_DURATION[i][1];
+            var wrongVal = JS_DATA[wrongKey];
+            if (typeof wrongVal === 'number' && wrongVal > 0 &&
+                prayerDuration === wrongVal && forcedCounterSeconds === wrongVal) {
+                _L('IQAMA', 'FIX_WRONG_DURATION', {
+                    from: wrongKey, to: rightKey, wrongVal: wrongVal, rightVal: JS_DATA[rightKey]
+                });
+                prayerDuration = JS_DATA[rightKey];
+                break;
+            }
+        }
+        return _origStartIqamaCounter2.apply(this, [iqamaMinutes, prayerDuration, forcedCounterSeconds]);
     };
 })();
 
