@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.53';
+var CUSTOM_APP_VERSION = '14.54';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -25323,11 +25323,32 @@ function selectQPTakbir() {
         // automation omis sur téléphone : JS_CUSTOM n'y contient QUE les valeurs
         // par défaut (jamais appliquées depuis mosques, cf. _applyRow/
         // _ucIsBoxDevice) -- les pousser écraserait la config réelle d'une box.
-        // Les colonnes horaires (jumua/iqama/azan_offsets/eid/time_flags) NE
-        // sont PAS touchées ici : sur une mosquée déjà établie elles gardent
-        // leur valeur (merge-duplicates ne touche pas les colonnes absentes) ;
-        // sur une nouvelle proposition elles prennent leur défaut jsonb et
-        // l'app mosque-admin les renseigne à l'approbation (elle lit backup_json).
+        // Les colonnes horaires (jumua/iqama/azan_offsets/eid/time_flags) ne sont
+        // PAS touchées ici sur une NOUVELLE proposition (isProposal) : elles
+        // prennent leur défaut jsonb et l'app mosque-admin les renseigne à
+        // l'approbation (elle lit backup_json) -- ne jamais faire porter à un
+        // proposant les horaires par défaut de son propre appareil.
+        //
+        // BUG CORRIGÉ (retour utilisateur 19/09/2026, mosquée tn.monastir.ghofran,
+        // généralisable à N'IMPORTE QUELLE mosquée déjà établie) : jusqu'ici, sur
+        // une mosquée déjà établie (isProposal=false), ces colonnes horaires
+        // n'étaient PAS non plus incluses -- seul "Notifier" (_sendPayload plus
+        // bas, même fichier) les poussait. Résultat : un utilisateur qui modifie
+        // les délais d'iqama puis utilise "Exporter la config -> Distant" (et non
+        // "Notifier") reçoit un toast "exporté" alors que ses nouveaux délais ne
+        // sont PAS écrits sur `mosques.iqama_delay`. Pire : cette écriture fait
+        // quand même avancer `updated_at` (profil/backup_json ont changé) sans
+        // poser le garde-fou UC_SELF_WRITE_INFLIGHT (contrairement à
+        // _installAutoExportAfterRemoteEdit/_patchPinHashToServer) -- le polling
+        // 18s de CET appareil (_installRemoteConfigPolling) redétecte donc ce
+        // updated_at comme "changement distant" et rappelle _applyRow, qui
+        // réapplique la colonne iqama_delay -- restée à son ANCIENNE valeur --
+        // par-dessus l'édition locale : les nouveaux délais disparaissent en
+        // ~18s, sans erreur visible. Fix : sur une mosquée déjà établie, "Export
+        // config" inclut désormais les mêmes colonnes horaires que "Notifier"
+        // (via window._buildAdminPayload, même source JS_DATA) -- l'export
+        // redevient un vrai instantané complet de la config locale, quelle que
+        // soit la mosquée, présente ou future.
         var _mqProfile = {
             address:        JS_CUSTOM.ucMosqueAddress        || '',
             phone:          JS_CUSTOM.ucMosquePhone           || '',
@@ -25355,6 +25376,22 @@ function selectQPTakbir() {
         // .webp existait toujours). Clé omise = colonne préservée. Il n'existe
         // aucun bouton "supprimer la photo" : pas besoin de pousser null.
         if (JS_CUSTOM.ucMosqueImageUrl) row.image_url = JS_CUSTOM.ucMosqueImageUrl;
+        // Horaires (iqama/azan/jumua/eid/heures) : cf. commentaire ci-dessus --
+        // inclus SAUF sur une nouvelle proposition, où mosque-admin doit rester
+        // seul à les renseigner à l'approbation. Même builder que "Notifier"
+        // (_buildAdminPayload, exposé plus bas dans ce fichier) pour ne pas
+        // dupliquer la lecture de JS_DATA/JS_CUSTOM à deux endroits.
+        if (!isProposal && typeof window._buildAdminPayload === 'function') {
+            var _sched = window._buildAdminPayload();
+            row.time_flags          = _sched.time_flags;
+            row.azan_offsets        = _sched.azan_offsets;
+            row.iqama_delay         = _sched.iqama_delay;
+            row.iqama_fixed         = _sched.iqama_fixed;
+            row.jumua                = _sched.jumua;
+            row.eid                  = _sched.eid;
+            row.primary_azan        = _sched.primary_azan;
+            row.dohr_before_asr_min = _sched.dohr_before_asr_min;
+        }
         // Nouvelle proposition uniquement : status='pending' (à valider dans
         // mosque-admin). Un export/sync sur une mosquée déjà établie n'envoie
         // pas de status -> merge-duplicates préserve la valeur existante.
