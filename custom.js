@@ -1106,7 +1106,7 @@ function _ucRegisterFlipMuteTarget(getAudioFn) {
 // dans l'app (onglet navigateur, écran principal, "À propos", menu latéral) —
 // cf. release/instapk.ps1 "setversion" pour la mettre à jour automatiquement
 // ici ET dans app/build.gradle (versionName/versionCode) en une seule commande.
-var CUSTOM_APP_VERSION = '14.54';
+var CUSTOM_APP_VERSION = '14.55';
 document.title = 'TAWKIT.NET ' + CUSTOM_APP_VERSION; //Titre onglet navigateur
 
 if (typeof appVersionString !== 'undefined') { // Affichage de la version dans l'app (en bas à droite) et dans la page "À propos"
@@ -2951,25 +2951,64 @@ window._ucUnmuteMosque    = _ucUnmuteMosque;
         return;
     }
 
+    // Le tag legacy mosque_id n'est plus posé (retiré natif-side) : le plan
+    // gratuit OneSignal limite le nombre de tags par appareil, un dépassement
+    // fait rejeter TOUS les set-tag du lot (entitlements-tag-limit) -> aucune
+    // notification reçue (cas réel Mediouni 20/09/2026).
     if (typeof window.AndroidMobile.setMosqueId === 'function') {
         window.AndroidMobile.setMosqueId(_mosqueId);
-        console.log('[ONESIGNAL] Tag mosque_id posé (informatif) : ' + _mosqueId);
     }
 
     var _hist  = _ucAddMosqueToHistory(_mosqueId);
     var _muted = _ucGetMutedMosques();
-    var _added = [], _removed = [];
-    _hist.forEach(function(id) {
+    // Limite du plan OneSignal gratuit : 6 tags par appareil (mesuré le
+    // 20/09/2026 : 6 acceptés, 7 rejetés). Les tags mosque_admin_<id> comptent
+    // dans ces 6 -> plafond des mosque_sub_<id> = 6 - admins armés (min 1).
+    // Mosquée COURANTE en premier (jamais sacrifiée), puis les plus récemment
+    // ajoutées à l'historique.
+    var _adminCount = 0;
+    try {
+        var _am = JSON.parse(localStorage.getItem('UC_ADMIN_PUSH_FOR') || '{}') || {};
+        var _now = Date.now();
+        Object.keys(_am).forEach(function(k) {
+            if (typeof _am[k] === 'number' && (_now - _am[k]) <= 90 * 24 * 60 * 60 * 1000) _adminCount++;
+        });
+    } catch(e) {}
+    var _UC_MAX_SUB_TAGS = Math.max(1, 6 - _adminCount);
+    // Mosquée anonyme (modèle générique) : jamais de tag (n'existe pas côté serveur).
+    var _ordered = [_mosqueId].concat(_hist.slice().reverse().filter(function(id) { return id !== _mosqueId; }))
+        .filter(function(id) { return !_ucIsAnonymousMosqueId(id); });
+    var _keep = [], _toAdd = [], _removed = [], _capped = [];
+    _ordered.forEach(function(id) {
         if (_muted.indexOf(id) !== -1) {
-            if (typeof window.AndroidMobile.removeMosqueSubscriptionTag === 'function') {
-                window.AndroidMobile.removeMosqueSubscriptionTag(id);
-                _removed.push(id);
-            }
-        } else if (typeof window.AndroidMobile.addMosqueSubscriptionTag === 'function') {
-            window.AndroidMobile.addMosqueSubscriptionTag(id);
-            _added.push(id);
+            _removed.push(id);
+        } else if (_keep.length >= _UC_MAX_SUB_TAGS) {
+            _capped.push(id);
+        } else {
+            _keep.push(id);
+            _toAdd.push(id);
         }
     });
+    var _AM = window.AndroidMobile;
+    // ÉTAPE 1 : suppressions d'abord (tags périmés / en sourdine / au-delà du
+    // plafond). OneSignal fusionne les opérations proches en UN SEUL PATCH et le
+    // serveur rejette tout le lot si le total dépasse la limite (même quand les
+    // suppressions le ramènent dessous) -> ajouts dans un second temps, une fois
+    // les suppressions envoyées.
+    _removed.concat(_capped).forEach(function(id) {
+        if (typeof _AM.removeMosqueSubscriptionTag === 'function') _AM.removeMosqueSubscriptionTag(id);
+    });
+    if (typeof _AM.pruneMosqueSubscriptionTags === 'function') {
+        try { _AM.pruneMosqueSubscriptionTags(JSON.stringify(_keep)); } catch(e) {}
+    }
+    // ÉTAPE 2 : ajouts, 8 s plus tard (au-delà de la fenêtre de fusion d'OneSignal).
+    var _added = _toAdd;
+    setTimeout(function() {
+        _toAdd.forEach(function(id) {
+            if (typeof _AM.addMosqueSubscriptionTag === 'function') _AM.addMosqueSubscriptionTag(id);
+        });
+    }, 8000);
+    if (_capped.length)  console.log('[ONESIGNAL] Tags abonnement au-delà du plafond ' + _UC_MAX_SUB_TAGS + ' (non posés) : ' + _capped.join(', '));
     if (_added.length)   console.log('[ONESIGNAL] Tags abonnement posés : '  + _added.join(', '));
     if (_removed.length) console.log('[ONESIGNAL] Tags abonnement retirés (sourdine) : ' + _removed.join(', '));
 })();
@@ -12984,6 +13023,58 @@ function _doAudioUnlock() {
     }
     setInterval(_sweep, CHECK_MS);
     _L('CUSTOM', 'INIT', { item: 'miniOverlayInvariantGuard' });
+})();
+
+// ── TRACE DIAGNOSTIC : chaque changement de classe des conteneurs du compteur
+// iqama, avec le contexte (rapport 20/09/2026, mosquée Mediouni : compteur
+// absent après l'azan puis disparu avant sa fin, aucune trace dans les logs).
+// Log '[CTR] OVERLAY' : id, ancienne -> nouvelle classe, état du compteur
+// (actif, secondes restantes, mode plein écran), page azan visible, et les
+// premières lignes de la pile d'appel (= QUI a fait le changement).
+(function _installCounterOverlayTrace() {
+    var _ids = [
+        'iqamaCounterContainerVertical', 'iqamaCounterContainerHorizontal',
+        'fullScreenCounterContainerVertical', 'fullScreenCounterContainerHorizontal',
+        'secondCounterContainerVertical', 'secondCounterContainerHorizontal'
+    ];
+    var _prev = {};
+    // L'observer est asynchrone (microtâche) : la pile n'y dit rien. On capture
+    // donc la pile au moment de l'écriture de className via un setter espion.
+    var _lastStack = {};
+    var _desc = Object.getOwnPropertyDescriptor(Element.prototype, 'className');
+    _ids.forEach(function (id) {
+        var el = document.getElementById(id);
+        if (!el || !_desc || !_desc.set) return;
+        _prev[id] = el.className;
+        try {
+            Object.defineProperty(el, 'className', {
+                configurable: true,
+                get: function () { return _desc.get.call(this); },
+                set: function (v) {
+                    try {
+                        _lastStack[id] = String(new Error().stack || '').split('\n').slice(2, 5)
+                            .map(function (s) { return s.trim().replace(/^at\s+/, '').replace(/file:\/\/\/android_asset\//g, ''); })
+                            .join(' < ');
+                    } catch (e) {}
+                    _desc.set.call(this, v);
+                }
+            });
+        } catch (e) {}
+        new MutationObserver(function () {
+            var now = el.className;
+            if (now === _prev[id]) return;
+            _L('CTR', 'OVERLAY', {
+                id: id, from: _prev[id], to: now,
+                active: (typeof isIqamaCounterActive !== 'undefined') ? isIqamaCounterActive : 'undef',
+                rem: (typeof remainingSeconds !== 'undefined') ? remainingSeconds : 'undef',
+                fs: (typeof isFullScreenCounterMode !== 'undefined') ? isFullScreenCounterMode : 'undef',
+                azan: (typeof isAzanPopupVisible !== 'undefined') ? isAzanPopupVisible : 'undef',
+                by: _lastStack[id] || 'style/classList'
+            });
+            _prev[id] = now;
+        }).observe(el, { attributes: true, attributeFilter: ['class'] });
+    });
+    _L('CUSTOM', 'INIT', { item: 'counterOverlayTrace' });
 })();
 
 
@@ -28186,7 +28277,10 @@ window._ucAddNotifHistory = _ucAddNotifHistory;
         .then(function(r) { return r.json(); })
         .then(function(res) {
             _L('MSG', 'SENT', res);
-            window._ucToast && window._ucToast(_mpT('sentOk'), 'ok');
+            // OneSignal peut répondre 200 avec 0 destinataire (aucun appareil
+            // ne porte le tag mosque_sub_<id>) : ne pas annoncer un succès.
+            var _none = res && (res.recipients === 0 || (res.errors && res.errors.length));
+            window._ucToast && window._ucToast(_none ? '0 destinataire : aucun appareil abonné à cette mosquée' : _mpT('sentOk'), _none ? 'err' : 'ok');
             window._ucAddNotifHistory && window._ucAddNotifHistory('message', msg, true);
         })
         .catch(function(e) {
